@@ -35,12 +35,13 @@ from tqdm import tqdm
 dataset_root = os.environ.get("GI_TRACT_DATASET_PATH")
 if not dataset_root:
     raise ValueError(
-        "GI_TRACT_DATASET_PATH is not set. Run download_dataset.py once, then set it with "
-        "'export GI_TRACT_DATASET_PATH=$(cat dataset_path.txt)'."
+        "GI_TRACT_DATASET_PATH is not set. Run download_dataset.py once, then set "
+        "GI_TRACT_DATASET_PATH to the path stored in dataset_path.txt."
     )
 
 
 def resolve_dataset_path(root_path):
+    """Resolve dataset directory from either dataset root or parent folder path."""
     root_path_normalized = os.path.normpath(root_path)
     dataset_path = (
         root_path_normalized

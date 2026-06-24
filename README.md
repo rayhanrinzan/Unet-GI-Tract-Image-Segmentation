@@ -15,3 +15,9 @@ Before training, set:
 ```bash
 export GI_TRACT_DATASET_PATH="<downloaded_dataset_path>"
 ```
+
+Or (bash/zsh), load it directly from the generated file:
+
+```bash
+export GI_TRACT_DATASET_PATH="$(cat dataset_path.txt)"
+```

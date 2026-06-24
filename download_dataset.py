@@ -5,6 +5,7 @@ import kagglehub
 
 
 def main():
+    """Download the dataset once and persist the resolved local path to a text file."""
     parser = argparse.ArgumentParser(description="Download the UW-Madison GI Tract dataset once.")
     parser.add_argument(
         "--path-file",
