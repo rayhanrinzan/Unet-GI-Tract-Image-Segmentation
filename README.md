@@ -21,3 +21,8 @@ Or (bash/zsh), load it directly from the generated file:
 ```bash
 export GI_TRACT_DATASET_PATH="$(cat dataset_path.txt)"
 ```
+## Entry point
+The main script is now `main.py`.
+
+## Run
+This project was originally written as a Colab-style notebook export, so you may need to remove notebook-only commands like `!pip install ...`, `from google.colab import drive`, and `!wandb login --relogin` before running it as a standalone Python script.
