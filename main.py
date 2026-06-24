@@ -1,90 +1,112 @@
-# -*- coding: utf-8 -*-
-"""MRIScans.ipynb
-Original file is located at
-    https://colab.research.google.com/drive/1LMaEPliy4wN-FdQkdmINzgNSNN_2lW7i
+#!/usr/bin/env python3
+"""Train a U-Net for GI tract MRI segmentation on a Slurm cluster.
+
+This version is converted from a Colab notebook into a normal Python script:
+- no google.colab imports
+- no !pip install / !wandb login notebook commands
+- dataset path comes from --dataset-root or GI_TRACT_DATASET_PATH
+- model outputs are saved to --output-dir
+- Weights & Biases logging is optional with --use-wandb
 """
 
-from google.colab import drive
-drive.mount('/content/drive')
-
-import copy
+import argparse
 import os
 import random
-import shutil
-import zipfile
-from math import atan2, cos, sin, sqrt, pi, log
+from pathlib import Path
+
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.v2 as v2
-import pandas as pd
-from PIL import Image
-from numpy import linalg as LA
-from torch import optim, nn
-from torch.utils.data import DataLoader, random_split
+from torch import optim
+from torch.utils.data import DataLoader
 from torch.utils.data.dataset import Dataset
-from torchvision import transforms
 from tqdm import tqdm
 
-dataset_root = os.environ.get("GI_TRACT_DATASET_PATH")
-if not dataset_root:
-    raise ValueError(
-        "GI_TRACT_DATASET_PATH is not set. Run download_dataset.py once, then set "
-        "GI_TRACT_DATASET_PATH to the path stored in dataset_path.txt."
+import solt as sl
+import solt.transforms as slt
+
+
+IMAGE_SIZE = 266
+NUM_CLASSES = 6  # background + 5 organ classes
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train U-Net on GI tract MRI segmentation data")
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default=os.environ.get("GI_TRACT_DATASET_PATH"),
+        help="Path to the dataset root. Can point either to the folder containing 'dataset/' or to 'dataset/' itself. "
+             "If omitted, GI_TRACT_DATASET_PATH is used.",
     )
+    parser.add_argument("--output-dir", type=str, default="outputs", help="Folder for saved models/logs")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-augment", action="store_true", help="Disable solt data augmentation")
+    parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="MRI Scans 5")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    return parser.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def resolve_dataset_path(root_path):
     """Resolve dataset path assuming folder name 'dataset' when root_path is its parent."""
-    root_path_normalized = os.path.normpath(root_path)
-    dataset_path = (
-        root_path_normalized
-        if os.path.basename(root_path_normalized) == "dataset"
-        else os.path.join(root_path_normalized, "dataset")
-    )
-    if not os.path.isdir(dataset_path):
+    if not root_path:
         raise ValueError(
-            f"Dataset directory not found at '{dataset_path}'. "
-            "Expected a folder named 'dataset' or GI_TRACT_DATASET_PATH pointing directly to it."
+            "No dataset path provided. Set GI_TRACT_DATASET_PATH or pass --dataset-root. "
+            "The path should point to the downloaded Kaggle folder or directly to its dataset/ folder."
         )
+
+    root = Path(root_path).expanduser().resolve()
+    dataset_path = root if root.name == "dataset" else root / "dataset"
+
+    if not dataset_path.is_dir():
+        raise ValueError(
+            f"Dataset directory not found at: {dataset_path}\n"
+            "Expected either --dataset-root /path/to/.../dataset or a folder containing dataset/."
+        )
+
     return dataset_path
 
-!pip install solt
-import solt as sl
-import solt.transforms as slt
 
-trfs = sl.Stream([
-    slt.Rotate((-15, 15), padding='r'),
-    slt.Shear(range_x=(-0.1, 0.1), range_y=(-0.1, 0.1), padding='r'),
-    slt.Contrast(contrast_range=(0.6, 1.3)),
-    slt.Brightness(brightness_range=(0.8, 1.2)),
-    slt.Blur(p=0.1, blur_type='m', k_size=(3,)),
-    slt.SaltAndPepper(p=0.1, gain_range=0.05),
-    sl.SelectiveStream([
+def build_solt_transforms():
+    return sl.Stream([
+        slt.Rotate((-15, 15), padding="r"),
+        slt.Shear(range_x=(-0.1, 0.1), range_y=(-0.1, 0.1), padding="r"),
+        slt.Contrast(contrast_range=(0.6, 1.3)),
+        slt.Brightness(brightness_range=(0.8, 1.2)),
+        slt.Blur(p=0.1, blur_type="m", k_size=(3,)),
+        slt.SaltAndPepper(p=0.1, gain_range=0.05),
         sl.SelectiveStream([
-            slt.CutOut(cutout_size=32),
-            slt.CutOut(cutout_size=32),
-            slt.CutOut(cutout_size=16),
-            slt.CutOut(cutout_size=16),
-            slt.CutOut(cutout_size=12),
-            slt.CutOut(cutout_size=12),
-            slt.CutOut(cutout_size=8),
-            slt.CutOut(cutout_size=8),
-        ], n=2),
-        sl.Stream(),
-    ], probs=[0.8, 0.2]),
-])
+            sl.SelectiveStream([
+                slt.CutOut(cutout_size=32),
+                slt.CutOut(cutout_size=32),
+                slt.CutOut(cutout_size=16),
+                slt.CutOut(cutout_size=16),
+                slt.CutOut(cutout_size=12),
+                slt.CutOut(cutout_size=12),
+                slt.CutOut(cutout_size=8),
+                slt.CutOut(cutout_size=8),
+            ], n=2),
+            sl.Stream(),
+        ], probs=[0.8, 0.2]),
+    ])
 
-!pip install wandb -qU
-# Log in to your W&B account
-import wandb
-import random
-import math
-
-!wandb login --relogin
 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -93,11 +115,12 @@ class DoubleConv(nn.Module):
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
         return self.conv_op(x)
+
 
 class DownSample(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -107,29 +130,30 @@ class DownSample(nn.Module):
 
     def forward(self, x):
         down = self.conv(x)
-        p = self.pool(down)
+        pooled = self.pool(down)
+        return down, pooled
 
-        return down, p
 
 class UpSample(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, in_channels//2, kernel_size=2, stride=2)
+        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
         self.conv = DoubleConv(in_channels, out_channels)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
 
-        # Fix spatial mismatch by padding x1 to match x2 size
-        # This happens when input dimensions are not powers of 2 (like 266)
-        diffY = x2.size()[2] - x1.size()[2]
-        diffX = x2.size()[3] - x1.size()[3]
+        diff_y = x2.size(2) - x1.size(2)
+        diff_x = x2.size(3) - x1.size(3)
 
-        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
-                        diffY // 2, diffY - diffY // 2])
+        x1 = F.pad(
+            x1,
+            [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2],
+        )
 
-        x = torch.cat([x1, x2], 1)
+        x = torch.cat([x1, x2], dim=1)
         return self.conv(x)
+
 
 class UNet(nn.Module):
     def __init__(self, in_channels, num_classes):
@@ -138,14 +162,11 @@ class UNet(nn.Module):
         self.down_convolution_2 = DownSample(64, 128)
         self.down_convolution_3 = DownSample(128, 256)
         self.down_convolution_4 = DownSample(256, 512)
-
         self.bottle_neck = DoubleConv(512, 1024)
-
         self.up_convolution_1 = UpSample(1024, 512)
         self.up_convolution_2 = UpSample(512, 256)
         self.up_convolution_3 = UpSample(256, 128)
         self.up_convolution_4 = UpSample(128, 64)
-
         self.out = nn.Conv2d(in_channels=64, out_channels=num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -153,170 +174,102 @@ class UNet(nn.Module):
         down_2, p2 = self.down_convolution_2(p1)
         down_3, p3 = self.down_convolution_3(p2)
         down_4, p4 = self.down_convolution_4(p3)
-
-        b = self.bottle_neck(p4)
-
-        up_1 = self.up_convolution_1(b, down_4)
+        bottleneck = self.bottle_neck(p4)
+        up_1 = self.up_convolution_1(bottleneck, down_4)
         up_2 = self.up_convolution_2(up_1, down_3)
         up_3 = self.up_convolution_3(up_2, down_2)
         up_4 = self.up_convolution_4(up_3, down_1)
+        return self.out(up_4)
 
-        out = self.out(up_4)
-        return out
 
 def pixel_decoder(encoded_pixels):
-  encoded_pixels = encoded_pixels.split()
-  starts = []
-  lengths = []
-  for i in range(0, len(encoded_pixels), 2):
-    starts.append(int(encoded_pixels[i]))
+    encoded_pixels = str(encoded_pixels).split()
+    starts = [int(encoded_pixels[i]) for i in range(0, len(encoded_pixels), 2)]
+    lengths = [int(encoded_pixels[i]) for i in range(1, len(encoded_pixels), 2)]
 
-  for i in range(1, len(encoded_pixels), 2):
-    lengths.append(int(encoded_pixels[i]))
+    mask = np.zeros(IMAGE_SIZE * IMAGE_SIZE, dtype=np.uint8)
+    for start, length in zip(starts, lengths):
+        start_idx = start - 1
+        end_idx = start_idx + length
+        mask[start_idx:end_idx] = 1
 
-  mask = np.zeros(266 * 266, dtype=int)
+    return mask
 
-  for i, start in enumerate(starts):
-    start_idx = start - 1 # apparently RLE indexing starts at 1, so subtract to account for this
-    end_idx = start_idx + lengths[i]
-    mask[start_idx:end_idx] = 1
 
-  return(mask, starts, lengths)
-
-transform = v2.Compose([
+image_transform = v2.Compose([
     v2.ToImage(),
-    v2.Resize((266, 266), antialias=True),
-    v2.ToDtype(torch.float32, scale=False),
-    # add normalization later
+    v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
+    v2.ToDtype(torch.float32, scale=True),
 ])
 
+
 def apply_solt(solt_pipeline, img, mask):
-    """Helper function to handle solt's dimension requirements cleanly."""
-    # Force image to match mask dimensions to prevent DataContainer mismatch errors
+    """Apply paired image/mask augmentations with solt."""
     if img.shape[:2] != mask.shape[:2]:
         img = cv2.resize(img, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
 
     img_c = np.expand_dims(img, axis=-1) if img.ndim == 2 else img
     mask_c = np.expand_dims(mask, axis=-1) if mask.ndim == 2 else mask
 
-    data = sl.core.DataContainer((img_c, mask_c), 'IM')
+    data = sl.core.DataContainer((img_c, mask_c), "IM")
     res = solt_pipeline(data, return_torch=False)
 
-    return res.data[0].squeeze(), res.data[1].squeeze()
+    aug_img = res.data[0].squeeze()
+    aug_mask = res.data[1].squeeze()
+
+    aug_mask = np.rint(aug_mask).astype(np.int64)
+    aug_mask = np.clip(aug_mask, 0, NUM_CLASSES - 1)
+
+    return aug_img, aug_mask
 
 
 class CustomDataset(Dataset):
-  def __init__(self, slice_contour_pairs, transform=None, mask_data_cache=None, solt_transform=None):
-    self.slice_contour_pairs = slice_contour_pairs
-    self.transform = transform
-    self.mask_data_cache = mask_data_cache # Store the cache
-    self.solt_transform = solt_transform
+    def __init__(self, slice_contour_pairs, transform=None, mask_data_cache=None, solt_transform=None):
+        self.slice_contour_pairs = slice_contour_pairs
+        self.transform = transform
+        self.mask_data_cache = mask_data_cache
+        self.solt_transform = solt_transform
 
-  def __len__(self):
-    return len(self.slice_contour_pairs)
+    def __len__(self):
+        return len(self.slice_contour_pairs)
 
-  def __getitem__(self, idx):
-    slice_id, slice_path, contour_csv_path = self.slice_contour_pairs[idx]
-    img = cv2.imread(slice_path, cv2.IMREAD_UNCHANGED)
+    def __getitem__(self, idx):
+        slice_id, slice_path, contour_csv_path = self.slice_contour_pairs[idx]
+        img = cv2.imread(str(slice_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise FileNotFoundError(f"Could not read image: {slice_path}")
 
-    # Convert to 8-bit uint8 to prevent OpenCV LUT crashes with solt
-    if img is not None and img.dtype == np.uint16:
-        img = (img / 256).astype(np.uint8)
+        if img.dtype == np.uint16:
+            img = (img / 256).astype(np.uint8)
 
-    # Use the cached DataFrame
-    df = self.mask_data_cache[contour_csv_path]
-    slice_rows = df[df["SliceID"] == slice_id]
+        df = self.mask_data_cache[contour_csv_path]
+        slice_rows = df[df["SliceID"] == slice_id]
 
-    # Initialize a single label map with zeros (background)
-    label_map = np.zeros((266, 266), dtype=np.int64)
+        label_map = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.int64)
 
-    for _, row in slice_rows.iterrows():
-      encoded_pixels = row["EncodedPixels"]
-      if str(encoded_pixels) != "-1":
-        mask, _, _ = pixel_decoder(encoded_pixels)
-        mask_2d = mask.reshape(266, 266)
-        organ_id = int(row["MaskTypeID"]) + 1
-        label_map[mask_2d == 1] = organ_id
+        for _, row in slice_rows.iterrows():
+            encoded_pixels = row["EncodedPixels"]
+            if str(encoded_pixels) != "-1":
+                mask = pixel_decoder(encoded_pixels)
+                mask_2d = mask.reshape(IMAGE_SIZE, IMAGE_SIZE)
+                organ_id = int(row["MaskTypeID"]) + 1
+                label_map[mask_2d == 1] = organ_id
 
-    # Apply solt transforms using the clean helper function
-    if self.solt_transform:
-      img, label_map = apply_solt(self.solt_transform, img, label_map)
+        if self.solt_transform is not None:
+            img, label_map = apply_solt(self.solt_transform, img, label_map)
 
-    if self.transform:
-      img = self.transform(img)
-    else:
-      # If no torchvision transform, ensure img is a torch tensor with a channel dimension
-      if isinstance(img, np.ndarray):
-          img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
+        if self.transform is not None:
+            img = self.transform(img)
+        else:
+            img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
 
-    target = torch.tensor(label_map, dtype=torch.long)
-    return img, target
+        target = torch.tensor(label_map, dtype=torch.long)
+        return img, target
 
-import random
-slice_contour_pairs = []
-
-dataset_path = resolve_dataset_path(dataset_root)
-dataset_cases = os.listdir(dataset_path)
-
-for case_name in dataset_cases:
-  case_path = dataset_path + "/" + case_name
-  case_days = os.listdir(case_path)
-  for case_day in case_days:
-    scans_path = case_path + "/" + case_day + "/" + "scans"
-    scans_list = os.listdir(scans_path)
-    contours_path = case_path + "/" + case_day + "/" + "contours"
-    contour_csv_path = contours_path + "/" + "masks_rle.csv"
-    for scan in scans_list:
-      slice_parts = scan.split("_")
-      slice_id = slice_parts[0] + "_" + slice_parts[1]
-      slice_path = scans_path + "/" + scan
-      slice_contour_pairs.append((slice_id, slice_path, contour_csv_path))
-
-unique_contour_csv_paths = set()
-for _, _, contour_csv_path in slice_contour_pairs:
-    unique_contour_csv_paths.add(contour_csv_path)
-
-mask_dfs_cache = {}
-for csv_path in unique_contour_csv_paths:
-    mask_dfs_cache[csv_path] = pd.read_csv(csv_path)
-
-# Group by scan_id to avoid data leakage, then do 70/10/20 split
-unique_scan_ids = list(set([pair[1].split("/")[-3] for pair in slice_contour_pairs]))
-random.seed(42) # Set seed for reproducibility
-random.shuffle(unique_scan_ids)
-
-num_scans = len(unique_scan_ids)
-train_idx = int(0.7 * num_scans)
-val_idx = train_idx + int(0.1 * num_scans)
-
-train_scan_ids = set(unique_scan_ids[:train_idx])
-val_scan_ids = set(unique_scan_ids[train_idx:val_idx])
-test_scan_ids = set(unique_scan_ids[val_idx:])
-
-train_pairs = []
-val_pairs = []
-test_pairs = []
-
-for pair in slice_contour_pairs:
-    scan_id = pair[1].split("/")[-3]
-    if scan_id in train_scan_ids:
-        train_pairs.append(pair)
-    elif scan_id in val_scan_ids:
-        val_pairs.append(pair)
-    elif scan_id in test_scan_ids:
-        test_pairs.append(pair)
-
-print(f"Total train samples: {len(train_pairs)}")
-print(f"Total validation samples: {len(val_pairs)}")
-print(f"Total test samples: {len(test_pairs)}")
-
-train_dataset = CustomDataset(train_pairs, transform, mask_data_cache=mask_dfs_cache, solt_transform=trfs)
-val_dataset = CustomDataset(val_pairs, transform, mask_data_cache=mask_dfs_cache)
-test_dataset = CustomDataset(test_pairs, transform, mask_data_cache=mask_dfs_cache)
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1):
-        super(DiceLoss, self).__init__()
+    def __init__(self, smooth=1.0):
+        super().__init__()
         self.smooth = smooth
 
     def forward(self, inputs, targets):
@@ -328,48 +281,100 @@ class DiceLoss(nn.Module):
         targets_one_hot = targets_one_hot.reshape(targets_one_hot.shape[0], targets_one_hot.shape[1], -1)
 
         intersection = (inputs * targets_one_hot).sum(2)
-        dice = (2. * intersection + self.smooth) / (inputs.sum(2) + targets_one_hot.sum(2) + self.smooth)
+        dice = (2.0 * intersection + self.smooth) / (
+            inputs.sum(2) + targets_one_hot.sum(2) + self.smooth
+        )
+        return 1.0 - dice.mean()
 
-        return 1 - dice.mean()
 
 class CombinedLoss(nn.Module):
-    def __init__(self):
-        super(CombinedLoss, self).__init__()
+    def __init__(self, device):
+        super().__init__()
         self.dice = DiceLoss()
-        # Adding weights: Background (0) gets low weight, Organs (1-5) get high weight
-        weights = torch.tensor([0.1, 1.0, 1.0, 1.0, 1.0, 1.0]).to(device)
+        weights = torch.tensor([0.1, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
         self.ce = nn.CrossEntropyLoss(weight=weights)
 
     def forward(self, inputs, targets):
         target_long = targets.long()
         return self.ce(inputs, target_long) + self.dice(inputs, target_long)
 
-import torch
-from torch.utils.data import DataLoader
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-learning_rate = 1e-4
-batch_size = 8
+def collect_slice_pairs(dataset_path):
+    slice_contour_pairs = []
+    dataset_cases = sorted(os.listdir(dataset_path))
 
-train_dataloader = DataLoader(train_dataset, batch_size, num_workers=0, shuffle=True, pin_memory = True, persistent_workers=False, prefetch_factor=None)
-val_dataloader = DataLoader(val_dataset, batch_size, num_workers=0, shuffle=False, pin_memory = True, persistent_workers=False, prefetch_factor=None)
-test_dataloader = DataLoader(test_dataset, batch_size, num_workers=0, shuffle=False, pin_memory = True, persistent_workers=False, prefetch_factor=None)
+    for case_name in dataset_cases:
+        case_path = Path(dataset_path) / case_name
+        if not case_path.is_dir():
+            continue
 
-# Updated num_classes to 6 (1 Background + 5 Organs) to match the indices 0-5
-model = UNet(in_channels=1, num_classes=6).to(device)
-optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
-criterion = CombinedLoss()
+        case_days = sorted(os.listdir(case_path))
+        for case_day in case_days:
+            scans_path = case_path / case_day / "scans"
+            contours_path = case_path / case_day / "contours"
+            contour_csv_path = contours_path / "masks_rle.csv"
 
-def train(dataloader, model, loss_fn, optimizer):
-  size = len(dataloader.dataset)
-  num_batches = len(dataloader)
-  model.train()
-  train_loss = 0
-  for batch, (X, y) in enumerate(dataloader):
-        X, y = X.to(device), y.to(device)
-        # Target `y` is already (B, H, W), no need to squeeze(1)
+            if not scans_path.is_dir() or not contour_csv_path.is_file():
+                continue
 
-        pred = model(X)
+            for scan in sorted(os.listdir(scans_path)):
+                slice_parts = scan.split("_")
+                slice_id = slice_parts[0] + "_" + slice_parts[1]
+                slice_path = scans_path / scan
+                slice_contour_pairs.append((slice_id, slice_path, contour_csv_path))
+
+    if not slice_contour_pairs:
+        raise ValueError(f"No scan/mask pairs found inside: {dataset_path}")
+
+    return slice_contour_pairs
+
+
+def split_pairs_by_scan(slice_contour_pairs, seed):
+    unique_scan_ids = list(set(pair[1].parent.parent.name for pair in slice_contour_pairs))
+    random.seed(seed)
+    random.shuffle(unique_scan_ids)
+
+    num_scans = len(unique_scan_ids)
+    train_idx = int(0.7 * num_scans)
+    val_idx = train_idx + int(0.1 * num_scans)
+
+    train_scan_ids = set(unique_scan_ids[:train_idx])
+    val_scan_ids = set(unique_scan_ids[train_idx:val_idx])
+    test_scan_ids = set(unique_scan_ids[val_idx:])
+
+    train_pairs, val_pairs, test_pairs = [], [], []
+    for pair in slice_contour_pairs:
+        scan_id = pair[1].parent.parent.name
+        if scan_id in train_scan_ids:
+            train_pairs.append(pair)
+        elif scan_id in val_scan_ids:
+            val_pairs.append(pair)
+        elif scan_id in test_scan_ids:
+            test_pairs.append(pair)
+
+    return train_pairs, val_pairs, test_pairs
+
+
+def build_mask_cache(slice_contour_pairs):
+    unique_contour_csv_paths = sorted({pair[2] for pair in slice_contour_pairs})
+    return {csv_path: pd.read_csv(csv_path) for csv_path in tqdm(unique_contour_csv_paths, desc="Loading mask CSVs")}
+
+
+def maybe_log(wandb_run, metrics):
+    if wandb_run is not None:
+        wandb_run.log(metrics)
+
+
+def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=None):
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
+    model.train()
+    train_loss = 0.0
+
+    for batch, (x, y) in enumerate(dataloader):
+        x, y = x.to(device), y.to(device)
+
+        pred = model(x)
         loss = loss_fn(pred, y)
 
         optimizer.zero_grad()
@@ -379,135 +384,172 @@ def train(dataloader, model, loss_fn, optimizer):
         train_loss += loss.item()
 
         if batch % 100 == 0:
-          loss_val, current = loss.item(), batch * len(X)
-          print(f"loss: {loss_val:>7f}  [{current:>5d}/{size:>5d}]")
-          # Log batch-level training loss
-          wandb.log({"Train/Step_Loss": loss_val})
+            loss_val = loss.item()
+            current = batch * len(x)
+            print(f"loss: {loss_val:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
+            maybe_log(wandb_run, {"Train/Step_Loss": loss_val})
 
-  avg_loss = train_loss / num_batches
-  return avg_loss
+    return train_loss / max(num_batches, 1)
 
-def evaluate(dataloader, model, loss_fn, split_name="Validation"):
+
+def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_run=None):
     num_batches = len(dataloader)
     model.eval()
-    test_loss = 0
+    total_loss = 0.0
     total_correct_pixels = 0
     total_pixels = 0
-    total_iou = 0
+    iou_sum = 0.0
+    iou_count = 0
 
     with torch.no_grad():
-        for X, y in dataloader:
-            X, y = X.to(device), y.to(device)
-            pred = model(X)
-            test_loss += loss_fn(pred, y).item()
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            total_loss += loss_fn(pred, y).item()
 
-            # Calculate pixel-wise accuracy
             predicted_classes = pred.argmax(1)
             total_correct_pixels += (predicted_classes == y).sum().item()
             total_pixels += y.numel()
 
-            # Simple Mean IoU calculation for the batch
-            # (Ignores background class 0 for a more meaningful metric)
-            for cls in range(1, 6):
+            for cls in range(1, NUM_CLASSES):
                 inter = ((predicted_classes == cls) & (y == cls)).sum().item()
                 union = ((predicted_classes == cls) | (y == cls)).sum().item()
                 if union > 0:
-                    total_iou += inter / union
+                    iou_sum += inter / union
+                    iou_count += 1
 
-    avg_loss = test_loss / num_batches
-    pixel_acc = total_correct_pixels / total_pixels
-    avg_iou = total_iou / (num_batches * 5) # 5 organ classes
+    avg_loss = total_loss / max(num_batches, 1)
+    pixel_acc = total_correct_pixels / max(total_pixels, 1)
+    avg_iou = iou_sum / max(iou_count, 1)
 
     print(f"{split_name} results:")
     print(f"  Avg loss: {avg_loss:>8f}")
-    print(f"  Pixel Accuracy: {(100*pixel_acc):>0.2f}%")
-    print(f"  Mean IoU (Organs): {avg_iou:>8f}\n")
+    print(f"  Pixel Accuracy: {(100 * pixel_acc):>0.2f}%")
+    print(f"  Mean IoU (Organs): {avg_iou:>8f}\n", flush=True)
 
-    # Log epoch-level metrics to W&B with the split name as a prefix
-    wandb.log({
-        f"{split_name}/Epoch_Loss": avg_loss,
-        f"{split_name}/Pixel_Accuracy": pixel_acc,
-        f"{split_name}/Mean_IoU": avg_iou
-    })
+    maybe_log(
+        wandb_run,
+        {
+            f"{split_name}/Epoch_Loss": avg_loss,
+            f"{split_name}/Pixel_Accuracy": pixel_acc,
+            f"{split_name}/Mean_IoU": avg_iou,
+        },
+    )
 
     return avg_loss
 
-total_runs = 4
-for run in range(total_runs):
-  # 1️. Start a new run to track this script
-  wandb.init(
-      # Set the project where this run will be logged
-      project="MRI Scans 5",
-      # We pass a run name (otherwise it’ll be randomly assigned, like sunshine-lollypop-10)
-      name=f"experiment_{run}",
-      # Track hyperparameters and run metadata
-      config={
-      "learning_rate": 1e-4,
-      "architecture": "Unet",
-      "dataset": "GI Tract Image Segmentation",
-      "epochs": 10,
-      })
 
-epochs = 10
-train_loss_history = []
-val_loss_history = []
-best_val_loss = float('inf')
+def main():
+    args = parse_args()
+    set_seed(args.seed)
 
-for t in range(epochs):
-    print(f"Epoch {t+1}\n-------------------------------")
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Train the model on the Training set
-    train_loss = train(train_dataloader, model, criterion, optimizer)
-    train_loss_history.append(train_loss)
+    dataset_path = resolve_dataset_path(args.dataset_root)
+    print(f"Using dataset path: {dataset_path}")
+    print(f"Saving outputs to: {output_dir}")
 
-    # Log epoch average training loss
-    wandb.log({"Train/Epoch_Loss": train_loss, "epoch": t+1})
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    # 2. Evaluate the model on the Validation set
-    if len(val_dataloader) > 0:
-        val_loss = evaluate(val_dataloader, model, criterion, split_name="Validation")
-        val_loss_history.append(val_loss)
+    slice_contour_pairs = collect_slice_pairs(dataset_path)
+    mask_dfs_cache = build_mask_cache(slice_contour_pairs)
+    train_pairs, val_pairs, test_pairs = split_pairs_by_scan(slice_contour_pairs, args.seed)
 
-        # Save the model if validation loss improved
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_save_path = 'unet_june17_best_model.pth'
-            torch.save(model.state_dict(), best_save_path)
-            print(f"--> Validation loss improved to {best_val_loss:.6f}! Saved best model to {best_save_path}")
+    print(f"Total train samples: {len(train_pairs)}")
+    print(f"Total validation samples: {len(val_pairs)}")
+    print(f"Total test samples: {len(test_pairs)}")
+
+    solt_transform = None if args.no_augment else build_solt_transforms()
+
+    train_dataset = CustomDataset(
+        train_pairs,
+        image_transform,
+        mask_data_cache=mask_dfs_cache,
+        solt_transform=solt_transform,
+    )
+    val_dataset = CustomDataset(val_pairs, image_transform, mask_data_cache=mask_dfs_cache)
+    test_dataset = CustomDataset(test_pairs, image_transform, mask_data_cache=mask_dfs_cache)
+
+    dataloader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": device == "cuda",
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 2
+
+    train_dataloader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
+    val_dataloader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
+    test_dataloader = DataLoader(test_dataset, shuffle=False, **dataloader_kwargs)
+
+    model = UNet(in_channels=1, num_classes=NUM_CLASSES).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    criterion = CombinedLoss(device=device)
+
+    wandb_run = None
+    if args.use_wandb:
+        import wandb
+
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config={
+                "learning_rate": args.learning_rate,
+                "architecture": "UNet",
+                "dataset": "GI Tract Image Segmentation",
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "num_workers": args.num_workers,
+                "seed": args.seed,
+                "augmentation": not args.no_augment,
+            },
+        )
+
+    train_loss_history = []
+    val_loss_history = []
+    best_val_loss = float("inf")
+    best_save_path = output_dir / "unet_best_model.pth"
+    final_save_path = output_dir / "unet_final_model.pth"
+
+    for epoch in range(args.epochs):
+        print(f"Epoch {epoch + 1}\n-------------------------------")
+
+        train_loss = train_one_epoch(train_dataloader, model, criterion, optimizer, device, wandb_run)
+        train_loss_history.append(train_loss)
+        maybe_log(wandb_run, {"Train/Epoch_Loss": train_loss, "epoch": epoch + 1})
+
+        if len(val_dataloader) > 0:
+            val_loss = evaluate(val_dataloader, model, criterion, device, split_name="Validation", wandb_run=wandb_run)
+            val_loss_history.append(val_loss)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), best_save_path)
+                print(f"--> Validation loss improved to {best_val_loss:.6f}! Saved best model to {best_save_path}")
+        else:
+            print("Skipping validation: val_dataloader is empty.")
+
+    print("Training Done!\n")
+    print("-------------------------------\nFinal Evaluation on Test Set:")
+    if len(test_dataloader) > 0:
+        evaluate(test_dataloader, model, criterion, device, split_name="Test", wandb_run=wandb_run)
     else:
-        print("Skipping val: val_dataloader is empty.")
-print("Training Done!\n")
+        print("Skipping test: test_dataloader is empty.")
 
-print("-------------------------------\nFinal Evaluation on Test Set:")
-# 3. Only after ALL epochs are done, evaluate on the Test set
-if len(test_dataloader) > 0:
-    evaluate(test_dataloader, model, criterion, split_name="Test")
+    torch.save(model.state_dict(), final_save_path)
+    print(f"Final model weights saved to {final_save_path}")
 
-# Save the final model weights and log them to W&B
-save_path = 'unet_june16_model_weights.pth'
-torch.save(model.state_dict(), save_path)
-print(f"Final model weights saved locally to {save_path}")
-wandb.save(save_path)
+    if wandb_run is not None:
+        wandb_run.save(str(final_save_path))
+        if best_save_path.exists():
+            wandb_run.save(str(best_save_path))
+        wandb_run.finish()
 
-# Log the best model to W&B as well if it was saved
-if 'best_save_path' in locals():
-    wandb.save(best_save_path)
 
-print("Model weights logged to Weights & Biases.")
-
-# Finish the W&B run
-wandb.finish()
-
-# Define the path where you want to save the model in your Google Drive
-save_path = '/content/drive/MyDrive/unet_june16_model_weights.pth'
-
-# Save the model's state dictionary (which contains the weights and biases)
-torch.save(model.state_dict(), save_path)
-
-print(f"Model weights saved successfully to {save_path}")
-
-loaded_model = UNet(in_channels=1, num_classes=6).to(device)
-
-loaded_model.load_state_dict(torch.load(save_path))
-
-loaded_model.eval()
+if __name__ == "__main__":
+    main()
