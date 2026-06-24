@@ -15,7 +15,7 @@ def main():
     args = parser.parse_args()
 
     dataset_path = kagglehub.dataset_download("happyharrycn/uw-madison-gi-tract-image-segmentation-dataset")
-    Path(args.path_file).write_text(dataset_path + "\n", encoding="utf-8")
+    Path(args.path_file).write_text(dataset_path, encoding="utf-8")
 
     print("Dataset downloaded to:", dataset_path)
     print("Saved dataset path to:", args.path_file)

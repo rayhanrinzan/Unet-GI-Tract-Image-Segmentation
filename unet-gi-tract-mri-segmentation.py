@@ -41,7 +41,7 @@ if not dataset_root:
 
 
 def resolve_dataset_path(root_path):
-    """Resolve dataset directory from either dataset root or parent folder path."""
+    """Resolve dataset path assuming folder name 'dataset' when root_path is its parent."""
     root_path_normalized = os.path.normpath(root_path)
     dataset_path = (
         root_path_normalized
