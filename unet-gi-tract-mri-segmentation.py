@@ -244,6 +244,11 @@ slice_contour_pairs = []
 
 os.listdir(dataset_root)
 dataset_path = dataset_root if os.path.basename(dataset_root) == "dataset" else os.path.join(dataset_root, "dataset")
+if not os.path.isdir(dataset_path):
+    raise ValueError(
+        f"Dataset directory not found at '{dataset_path}'. "
+        "Expected a folder named 'dataset' or GI_TRACT_DATASET_PATH pointing directly to it."
+    )
 dataset_cases = os.listdir(dataset_path)
 
 for case_name in dataset_cases:

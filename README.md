@@ -5,7 +5,7 @@ This repository contains a script for GI Tract Image Segmentation. It utilizes a
 Run:
 
 ```bash
-python /home/runner/work/Unet-GI-Tract-Image-Segmentation/Unet-GI-Tract-Image-Segmentation/download_dataset.py
+python download_dataset.py
 ```
 
 This downloads the dataset and writes the local dataset path to `dataset_path.txt`.
