@@ -251,7 +251,6 @@ class CustomDataset(Dataset):
 import random
 slice_contour_pairs = []
 
-os.listdir(dataset_root)
 dataset_path = resolve_dataset_path(dataset_root)
 dataset_cases = os.listdir(dataset_path)
 
