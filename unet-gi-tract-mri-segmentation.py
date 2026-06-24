@@ -10,13 +10,6 @@ Original file is located at
 from google.colab import drive
 drive.mount('/content/drive')
 
-import kagglehub
-
-# Download latest version
-path = kagglehub.dataset_download("happyharrycn/uw-madison-gi-tract-image-segmentation-dataset")
-
-print("Path to dataset files:", path)
-
 import copy
 import os
 import random
@@ -38,6 +31,29 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 from tqdm import tqdm
+
+dataset_root = os.environ.get("GI_TRACT_DATASET_PATH")
+if not dataset_root:
+    raise ValueError(
+        "GI_TRACT_DATASET_PATH is not set. Run download_dataset.py once, then set "
+        "GI_TRACT_DATASET_PATH to the path stored in dataset_path.txt."
+    )
+
+
+def resolve_dataset_path(root_path):
+    """Resolve dataset path assuming folder name 'dataset' when root_path is its parent."""
+    root_path_normalized = os.path.normpath(root_path)
+    dataset_path = (
+        root_path_normalized
+        if os.path.basename(root_path_normalized) == "dataset"
+        else os.path.join(root_path_normalized, "dataset")
+    )
+    if not os.path.isdir(dataset_path):
+        raise ValueError(
+            f"Dataset directory not found at '{dataset_path}'. "
+            "Expected a folder named 'dataset' or GI_TRACT_DATASET_PATH pointing directly to it."
+        )
+    return dataset_path
 
 !pip install solt
 import solt as sl
@@ -242,8 +258,7 @@ class CustomDataset(Dataset):
 import random
 slice_contour_pairs = []
 
-os.listdir(path)
-dataset_path = path + '/dataset'
+dataset_path = resolve_dataset_path(dataset_root)
 dataset_cases = os.listdir(dataset_path)
 
 for case_name in dataset_cases:
