@@ -2,7 +2,9 @@
 
 #SBATCH --job-name=unet_gi_mri
 #SBATCH --partition=preempt_gpu
+#SBATCH --account=imedslab
 #SBATCH --qos=low
+#SBATCH --chdir=/midtier/imedslab/rar4037/gi_mri_project
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --mem=48G
@@ -11,15 +13,19 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
-set -euo pipefail
+BASE=/midtier/imedslab/rar4037
 
-mkdir -p logs outputs
+mkdir -p outputs
+mkdir -p $BASE/wandb
+mkdir -p $BASE/.cache/wandb
 
 module purge
 module load miniconda3/22.11.1-ctkwnpe
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate mri
 
+echo "1"
+
+export HOME=$BASE
+export XDG_CACHE_HOME=$BASE/.cache
 export GI_TRACT_DATASET_PATH="$(cat dataset_path.txt)"
 
 echo "Dataset path: $GI_TRACT_DATASET_PATH"
@@ -27,9 +33,10 @@ echo "Running on node: $(hostname)"
 echo "Starting at: $(date)"
 
 python train.py \
---epochs 10 \
---batch-size 8 \
---num-workers 1 \
---output-dir outputs
+--epochs 1 \
+--batch-size 2 \
+--num-workers 0 \
+--output-dir outputs \
+--no-augment
 
 echo "Finished at: $(date)"
