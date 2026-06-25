@@ -199,7 +199,7 @@ def pixel_decoder(encoded_pixels):
 image_transform = v2.Compose([
     v2.ToImage(),
     v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
-    v2.ToDtype(torch.float32, scale=True),
+    v2.ToDtype(torch.float32),
 ])
 
 
@@ -239,8 +239,15 @@ class CustomDataset(Dataset):
         if img is None:
             raise FileNotFoundError(f"Could not read image: {slice_path}")
 
-        if img.dtype == np.uint16:
-            img = (img / 256).astype(np.uint8)
+        img = img.astype(np.float32)
+
+        # min-max normalization to get values in 0-1 range
+        img_min = img.min()
+        img_max = img.max()
+        if img_max > img_min:
+            img = (img - img_min) / (img_max - img_min)
+        else:
+            img = np.zeros_like(img, dtype=np.float32)
 
         df = self.mask_data_cache[contour_csv_path]
         slice_rows = df[df["SliceID"] == slice_id]
