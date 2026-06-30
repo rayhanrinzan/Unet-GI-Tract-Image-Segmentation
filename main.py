@@ -57,10 +57,10 @@ def parse_args():
 
 
 def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    random.seed(seed) # used for random shuffling between epochs
+    np.random.seed(seed) # not really used
+    torch.manual_seed(seed) # used for random model weights upon initialization
+    if torch.cuda.is_available(): # not necessary but good safety net for future changes
         torch.cuda.manual_seed_all(seed)
 
 
