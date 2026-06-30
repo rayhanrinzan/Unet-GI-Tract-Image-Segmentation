@@ -20,10 +20,7 @@ def build_solt_transforms():
     return sl.Stream([
         slt.Rotate((-15, 15), padding="r"),
         slt.Shear(range_x=(-0.1, 0.1), range_y=(-0.1, 0.1), padding="r"),
-        slt.Contrast(contrast_range=(0.6, 1.3)),
-        slt.Brightness(brightness_range=(0.8, 1.2)),
         slt.Blur(p=0.1, blur_type="m", k_size=(3,)),
-        slt.SaltAndPepper(p=0.1, gain_range=0.05),
         sl.SelectiveStream([
             sl.SelectiveStream([
                 slt.CutOut(cutout_size=32),
@@ -99,10 +96,9 @@ class CustomDataset(Dataset):
 
         img = img.astype(np.float32)
 
-        #min-max normalization to convert values to 0-1 range
+        # min-max normalization to get values in 0-1 range
         img_min = img.min()
         img_max = img.max()
-        
         if img_max > img_min:
             img = (img - img_min) / (img_max - img_min)
         else:
