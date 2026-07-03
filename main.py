@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-augment", action="store_true", help="Disable solt data augmentation")
+    parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="MRI Scans 5")
     parser.add_argument("--wandb-run-name", type=str, default=None)
