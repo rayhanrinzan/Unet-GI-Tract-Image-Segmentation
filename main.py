@@ -467,16 +467,13 @@ def main():
     print(f"Total validation samples: {len(val_pairs)}")
     print(f"Total test samples: {len(test_pairs)}")
 
-    solt_transform = None if args.no_augment else build_solt_transforms()
-
     train_dataset = CustomDataset(
         train_pairs,
-        image_transform,
+        eval_transform if args.no_augment else train_transform,
         mask_data_cache=mask_dfs_cache,
-        solt_transform=solt_transform,
     )
-    val_dataset = CustomDataset(val_pairs, image_transform, mask_data_cache=mask_dfs_cache)
-    test_dataset = CustomDataset(test_pairs, image_transform, mask_data_cache=mask_dfs_cache)
+    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
