@@ -14,24 +14,23 @@ import os
 import random
 from pathlib import Path
 
-import cv2
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms.v2 as v2
 from torch import optim
 from torch.utils.data import DataLoader
-from torch.utils.data.dataset import Dataset
-from tqdm import tqdm
 
-import solt as sl
-import solt.transforms as slt
-
-
-IMAGE_SIZE = 266
-NUM_CLASSES = 6  # background + 5 organ classes
+from dataloader import (
+    NUM_CLASSES,
+    CustomDataset,
+    build_mask_cache,
+    build_solt_transforms,
+    collect_slice_pairs,
+    image_transform,
+    split_pairs_by_scan,
+)
+from model import UNet
 
 
 def parse_args():
@@ -57,10 +56,10 @@ def parse_args():
 
 
 def set_seed(seed):
-    random.seed(seed) # used for random shuffling between epochs
-    np.random.seed(seed) # not really used
-    torch.manual_seed(seed) # used for random model weights upon initialization
-    if torch.cuda.is_available(): # not necessary but good safety net for future changes
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
@@ -82,193 +81,6 @@ def resolve_dataset_path(root_path):
         )
 
     return dataset_path
-
-
-def build_solt_transforms():
-    return sl.Stream([
-        slt.Rotate((-15, 15), padding="r"),
-        slt.Shear(range_x=(-0.1, 0.1), range_y=(-0.1, 0.1), padding="r"),
-        slt.Blur(p=0.1, blur_type="m", k_size=(3,)),
-        sl.SelectiveStream([
-            sl.SelectiveStream([
-                slt.CutOut(cutout_size=32),
-                slt.CutOut(cutout_size=32),
-                slt.CutOut(cutout_size=16),
-                slt.CutOut(cutout_size=16),
-                slt.CutOut(cutout_size=12),
-                slt.CutOut(cutout_size=12),
-                slt.CutOut(cutout_size=8),
-                slt.CutOut(cutout_size=8),
-            ], n=2),
-            sl.Stream(),
-        ], probs=[0.8, 0.2]),
-    ])
-
-
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv_op = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x):
-        return self.conv_op(x)
-
-
-class DownSample(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.conv = DoubleConv(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-    def forward(self, x):
-        down = self.conv(x)
-        pooled = self.pool(down)
-        return down, pooled
-
-
-class UpSample(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-
-        diff_y = x2.size(2) - x1.size(2)
-        diff_x = x2.size(3) - x1.size(3)
-
-        x1 = F.pad(
-            x1,
-            [diff_x // 2, diff_x - diff_x // 2, diff_y // 2, diff_y - diff_y // 2],
-        )
-
-        x = torch.cat([x1, x2], dim=1)
-        return self.conv(x)
-
-
-class UNet(nn.Module):
-    def __init__(self, in_channels, num_classes):
-        super().__init__()
-        self.down_convolution_1 = DownSample(in_channels, 64)
-        self.down_convolution_2 = DownSample(64, 128)
-        self.down_convolution_3 = DownSample(128, 256)
-        self.down_convolution_4 = DownSample(256, 512)
-        self.bottle_neck = DoubleConv(512, 1024)
-        self.up_convolution_1 = UpSample(1024, 512)
-        self.up_convolution_2 = UpSample(512, 256)
-        self.up_convolution_3 = UpSample(256, 128)
-        self.up_convolution_4 = UpSample(128, 64)
-        self.out = nn.Conv2d(in_channels=64, out_channels=num_classes, kernel_size=1)
-
-    def forward(self, x):
-        down_1, p1 = self.down_convolution_1(x)
-        down_2, p2 = self.down_convolution_2(p1)
-        down_3, p3 = self.down_convolution_3(p2)
-        down_4, p4 = self.down_convolution_4(p3)
-        bottleneck = self.bottle_neck(p4)
-        up_1 = self.up_convolution_1(bottleneck, down_4)
-        up_2 = self.up_convolution_2(up_1, down_3)
-        up_3 = self.up_convolution_3(up_2, down_2)
-        up_4 = self.up_convolution_4(up_3, down_1)
-        return self.out(up_4)
-
-
-def pixel_decoder(encoded_pixels):
-    encoded_pixels = str(encoded_pixels).split()
-    starts = [int(encoded_pixels[i]) for i in range(0, len(encoded_pixels), 2)]
-    lengths = [int(encoded_pixels[i]) for i in range(1, len(encoded_pixels), 2)]
-
-    mask = np.zeros(IMAGE_SIZE * IMAGE_SIZE, dtype=np.uint8)
-    for start, length in zip(starts, lengths):
-        start_idx = start - 1
-        end_idx = start_idx + length
-        mask[start_idx:end_idx] = 1
-
-    return mask
-
-
-image_transform = v2.Compose([
-    v2.ToImage(),
-    v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
-    v2.ToDtype(torch.float32),
-])
-
-
-def apply_solt(solt_pipeline, img, mask):
-    """Apply paired image/mask augmentations with solt."""
-    if img.shape[:2] != mask.shape[:2]:
-        img = cv2.resize(img, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-    img_c = np.expand_dims(img, axis=-1) if img.ndim == 2 else img
-    mask_c = np.expand_dims(mask, axis=-1) if mask.ndim == 2 else mask
-
-    data = sl.core.DataContainer((img_c, mask_c), "IM")
-    res = solt_pipeline(data, return_torch=False)
-
-    aug_img = res.data[0].squeeze()
-    aug_mask = res.data[1].squeeze()
-
-    aug_mask = np.rint(aug_mask).astype(np.int64)
-    aug_mask = np.clip(aug_mask, 0, NUM_CLASSES - 1)
-
-    return aug_img, aug_mask
-
-
-class CustomDataset(Dataset):
-    def __init__(self, slice_contour_pairs, transform=None, mask_data_cache=None, solt_transform=None):
-        self.slice_contour_pairs = slice_contour_pairs
-        self.transform = transform
-        self.mask_data_cache = mask_data_cache
-        self.solt_transform = solt_transform
-
-    def __len__(self):
-        return len(self.slice_contour_pairs)
-
-    def __getitem__(self, idx):
-        slice_id, slice_path, contour_csv_path = self.slice_contour_pairs[idx]
-        img = cv2.imread(str(slice_path), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {slice_path}")
-
-        img = img.astype(np.float32)
-
-        # min-max normalization to get values in 0-1 range
-        img_min = img.min()
-        img_max = img.max()
-        if img_max > img_min:
-            img = (img - img_min) / (img_max - img_min)
-        else:
-            img = np.zeros_like(img, dtype=np.float32)
-
-        df = self.mask_data_cache[contour_csv_path]
-        slice_rows = df[df["SliceID"] == slice_id]
-
-        label_map = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.int64)
-
-        for _, row in slice_rows.iterrows():
-            encoded_pixels = row["EncodedPixels"]
-            if str(encoded_pixels) != "-1":
-                mask = pixel_decoder(encoded_pixels)
-                mask_2d = mask.reshape(IMAGE_SIZE, IMAGE_SIZE)
-                organ_id = int(row["MaskTypeID"]) + 1
-                label_map[mask_2d == 1] = organ_id
-
-        if self.solt_transform is not None:
-            img, label_map = apply_solt(self.solt_transform, img, label_map)
-
-        if self.transform is not None:
-            img = self.transform(img)
-        else:
-            img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
-
-        target = torch.tensor(label_map, dtype=torch.long)
-        return img, target
 
 
 class DiceLoss(nn.Module):
@@ -301,67 +113,6 @@ class CombinedLoss(nn.Module):
     def forward(self, inputs, targets):
         target_long = targets.long()
         return self.ce(inputs, target_long) + self.dice(inputs, target_long)
-
-
-def collect_slice_pairs(dataset_path):
-    slice_contour_pairs = []
-    dataset_cases = sorted(os.listdir(dataset_path))
-
-    for case_name in dataset_cases:
-        case_path = Path(dataset_path) / case_name
-        if not case_path.is_dir():
-            continue
-
-        case_days = sorted(os.listdir(case_path))
-        for case_day in case_days:
-            scans_path = case_path / case_day / "scans"
-            contours_path = case_path / case_day / "contours"
-            contour_csv_path = contours_path / "masks_rle.csv"
-
-            if not scans_path.is_dir() or not contour_csv_path.is_file():
-                continue
-
-            for scan in sorted(os.listdir(scans_path)):
-                slice_parts = scan.split("_")
-                slice_id = slice_parts[0] + "_" + slice_parts[1]
-                slice_path = scans_path / scan
-                slice_contour_pairs.append((slice_id, slice_path, contour_csv_path))
-
-    if not slice_contour_pairs:
-        raise ValueError(f"No scan/mask pairs found inside: {dataset_path}")
-
-    return slice_contour_pairs
-
-
-def split_pairs_by_scan(slice_contour_pairs, seed):
-    unique_scan_ids = list(set(pair[1].parent.parent.name for pair in slice_contour_pairs))
-    random.seed(seed)
-    random.shuffle(unique_scan_ids)
-
-    num_scans = len(unique_scan_ids)
-    train_idx = int(0.7 * num_scans)
-    val_idx = train_idx + int(0.1 * num_scans)
-
-    train_scan_ids = set(unique_scan_ids[:train_idx])
-    val_scan_ids = set(unique_scan_ids[train_idx:val_idx])
-    test_scan_ids = set(unique_scan_ids[val_idx:])
-
-    train_pairs, val_pairs, test_pairs = [], [], []
-    for pair in slice_contour_pairs:
-        scan_id = pair[1].parent.parent.name
-        if scan_id in train_scan_ids:
-            train_pairs.append(pair)
-        elif scan_id in val_scan_ids:
-            val_pairs.append(pair)
-        elif scan_id in test_scan_ids:
-            test_pairs.append(pair)
-
-    return train_pairs, val_pairs, test_pairs
-
-
-def build_mask_cache(slice_contour_pairs):
-    unique_contour_csv_paths = sorted({pair[2] for pair in slice_contour_pairs})
-    return {csv_path: pd.read_csv(csv_path) for csv_path in tqdm(unique_contour_csv_paths, desc="Loading mask CSVs")}
 
 
 def maybe_log(wandb_run, metrics):
@@ -467,13 +218,16 @@ def main():
     print(f"Total validation samples: {len(val_pairs)}")
     print(f"Total test samples: {len(test_pairs)}")
 
+    solt_transform = None if args.no_augment else build_solt_transforms()
+
     train_dataset = CustomDataset(
         train_pairs,
-        eval_transform if args.no_augment else train_transform,
+        image_transform,
         mask_data_cache=mask_dfs_cache,
+        solt_transform=solt_transform,
     )
-    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+    val_dataset = CustomDataset(val_pairs, image_transform, mask_data_cache=mask_dfs_cache)
+    test_dataset = CustomDataset(test_pairs, image_transform, mask_data_cache=mask_dfs_cache)
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
