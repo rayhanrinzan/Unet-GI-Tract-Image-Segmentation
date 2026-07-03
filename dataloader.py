@@ -5,36 +5,15 @@ import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms.v2 as v2
+from torchvision import tv_tensors
+from torchvision.transforms import InterpolationMode
 from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
 
-import solt as sl
-import solt.transforms as slt
 
-
+RESIZE_SIZE = 286
 IMAGE_SIZE = 266
 NUM_CLASSES = 6  # background + 5 organ classes
-
-
-def build_solt_transforms():
-    return sl.Stream([
-        slt.Rotate((-15, 15), padding="r"),
-        slt.Shear(range_x=(-0.1, 0.1), range_y=(-0.1, 0.1), padding="r"),
-        slt.Blur(p=0.1, blur_type="m", k_size=(3,)),
-        sl.SelectiveStream([
-            sl.SelectiveStream([
-                slt.CutOut(cutout_size=32),
-                slt.CutOut(cutout_size=32),
-                slt.CutOut(cutout_size=16),
-                slt.CutOut(cutout_size=16),
-                slt.CutOut(cutout_size=12),
-                slt.CutOut(cutout_size=12),
-                slt.CutOut(cutout_size=8),
-                slt.CutOut(cutout_size=8),
-            ], n=2),
-            sl.Stream(),
-        ], probs=[0.8, 0.2]),
-    ])
 
 
 def pixel_decoder(encoded_pixels):
@@ -51,39 +30,28 @@ def pixel_decoder(encoded_pixels):
     return mask
 
 
-image_transform = v2.Compose([
-    v2.ToImage(),
-    v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
-    v2.ToDtype(torch.float32),
+train_transform = v2.Compose([
+    v2.Resize((RESIZE_SIZE, RESIZE_SIZE), antialias=True),
+    v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE)),
+    v2.RandomRotation(
+        degrees=(-10, 10),
+        interpolation=InterpolationMode.BILINEAR,
+        fill={tv_tensors.Image: 0.0, tv_tensors.Mask: 0},
+    ),
+    v2.RandomHorizontalFlip(p=0.3),
+    v2.RandomVerticalFlip(p=0.3),
 ])
 
-
-def apply_solt(solt_pipeline, img, mask):
-    """Apply paired image/mask augmentations with solt."""
-    if img.shape[:2] != mask.shape[:2]:
-        img = cv2.resize(img, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
-
-    img_c = np.expand_dims(img, axis=-1) if img.ndim == 2 else img
-    mask_c = np.expand_dims(mask, axis=-1) if mask.ndim == 2 else mask
-
-    data = sl.core.DataContainer((img_c, mask_c), "IM")
-    res = solt_pipeline(data, return_torch=False)
-
-    aug_img = res.data[0].squeeze()
-    aug_mask = res.data[1].squeeze()
-
-    aug_mask = np.rint(aug_mask).astype(np.int64)
-    aug_mask = np.clip(aug_mask, 0, NUM_CLASSES - 1)
-
-    return aug_img, aug_mask
-
+eval_transform = v2.Compose([
+    v2.Resize((RESIZE_SIZE, RESIZE_SIZE), antialias=True),
+    v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE)),
+])
 
 class CustomDataset(Dataset):
-    def __init__(self, slice_contour_pairs, transform=None, mask_data_cache=None, solt_transform=None):
+    def __init__(self, slice_contour_pairs, transform=None, mask_data_cache=None):
         self.slice_contour_pairs = slice_contour_pairs
         self.transform = transform
         self.mask_data_cache = mask_data_cache
-        self.solt_transform = solt_transform
 
     def __len__(self):
         return len(self.slice_contour_pairs)
@@ -117,15 +85,15 @@ class CustomDataset(Dataset):
                 organ_id = int(row["MaskTypeID"]) + 1
                 label_map[mask_2d == 1] = organ_id
 
-        if self.solt_transform is not None:
-            img, label_map = apply_solt(self.solt_transform, img, label_map)
-
+        img = tv_tensors.Image(torch.from_numpy(img).unsqueeze(0))
+        target = tv_tensors.Mask(torch.from_numpy(label_map))
+        
         if self.transform is not None:
-            img = self.transform(img)
-        else:
-            img = torch.tensor(img, dtype=torch.float32).unsqueeze(0)
-
-        target = torch.tensor(label_map, dtype=torch.long)
+            img, target = self.transform(img, target)
+        
+        img = img.as_subclass(torch.Tensor).float()
+        target = target.as_subclass(torch.Tensor).long()
+        
         return img, target
 
 
