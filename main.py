@@ -25,9 +25,9 @@ from dataloader import (
     NUM_CLASSES,
     CustomDataset,
     build_mask_cache,
-    build_solt_transforms,
     collect_slice_pairs,
-    image_transform,
+    train_transform,
+    eval_transform,
     split_pairs_by_scan,
 )
 from model import UNet
@@ -44,7 +44,7 @@ def parse_args():
     )
     parser.add_argument("--output-dir", type=str, default="outputs", help="Folder for saved models/logs")
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -218,16 +218,13 @@ def main():
     print(f"Total validation samples: {len(val_pairs)}")
     print(f"Total test samples: {len(test_pairs)}")
 
-    solt_transform = None if args.no_augment else build_solt_transforms()
-
     train_dataset = CustomDataset(
         train_pairs,
-        image_transform,
+        eval_transform if args.no_augment else train_transform,
         mask_data_cache=mask_dfs_cache,
-        solt_transform=solt_transform,
     )
-    val_dataset = CustomDataset(val_pairs, image_transform, mask_data_cache=mask_dfs_cache)
-    test_dataset = CustomDataset(test_pairs, image_transform, mask_data_cache=mask_dfs_cache)
+    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
