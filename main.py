@@ -10,6 +10,8 @@ This version is converted from a Colab notebook into a normal Python script:
 """
 
 #for visualizing scans/masks
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import argparse
@@ -227,7 +229,10 @@ def main():
     val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
     test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
-    # TEMP DEBUG BLOCK: visualize a few transformed samples, then exit
+    # TEMP DEBUG BLOCK: save a few transformed samples, then exit
+    debug_dir = output_dir / "debug_samples"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    
     for i in range(4):
         img, mask = train_dataset[i]
     
@@ -261,12 +266,17 @@ def main():
         plt.axis("off")
     
         plt.tight_layout()
-        plt.show()
     
-    print("Finished checking transformed samples. Exiting before training.")
+        save_path = debug_dir / f"sample_{i}.png"
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+    
+        print(f"Saved: {save_path}")
+    
+    print("Finished saving transformed samples. Exiting before training.")
     return
-    #end of temporary debugging logic
-    
+    # end of temporary debugging logic
+        
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
