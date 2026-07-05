@@ -9,11 +9,6 @@ This version is converted from a Colab notebook into a normal Python script:
 - Weights & Biases logging is optional with --use-wandb
 """
 
-#for visualizing scans/masks
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 import argparse
 import os
 import random
@@ -228,71 +223,6 @@ def main():
     )
     val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
     test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-
-        # TEMP DEBUG BLOCK: save a few transformed samples with non-empty masks, then exit
-    debug_dir = output_dir / "debug_samples"
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    
-    saved = 0
-    max_to_save = 4
-    max_to_check = 100  # only check first 100 samples, not the whole dataset
-    
-    for i in range(min(max_to_check, len(train_dataset))):
-        img, mask = train_dataset[i]
-    
-        img_np = img.squeeze().cpu().numpy()
-        mask_np = mask.cpu().numpy()
-    
-        unique_classes = np.unique(mask_np)
-        nonzero_pixels = np.count_nonzero(mask_np)
-    
-        # Skip slices where the mask is only background
-        if nonzero_pixels == 0:
-            print(f"Skipping sample {i}: mask only has background class {unique_classes}")
-            continue
-    
-        print(f"\nSample {i}")
-        print(f"Image shape: {img.shape}")
-        print(f"Mask shape: {mask.shape}")
-        print(f"Image min/max: {img_np.min():.4f}, {img_np.max():.4f}")
-        print(f"Mask unique classes: {unique_classes}")
-        print(f"Non-background pixels: {nonzero_pixels}")
-    
-        masked_organ = np.ma.masked_where(mask_np == 0, mask_np)
-    
-        plt.figure(figsize=(12, 4))
-    
-        plt.subplot(1, 3, 1)
-        plt.imshow(img_np, cmap="gray")
-        plt.title("Transformed Image")
-        plt.axis("off")
-    
-        plt.subplot(1, 3, 2)
-        plt.imshow(masked_organ, cmap="tab10", vmin=1, vmax=NUM_CLASSES - 1)
-        plt.title("Transformed Mask, organs only")
-        plt.axis("off")
-    
-        plt.subplot(1, 3, 3)
-        plt.imshow(img_np, cmap="gray")
-        plt.imshow(masked_organ, cmap="tab10", vmin=1, vmax=NUM_CLASSES - 1, alpha=0.45)
-        plt.title("Overlay")
-        plt.axis("off")
-    
-        plt.tight_layout()
-    
-        save_path = debug_dir / f"sample_{saved}_dataset_idx_{i}.png"
-        plt.savefig(save_path, dpi=150)
-        plt.close()
-    
-        print(f"Saved: {save_path}")
-    
-        saved += 1
-    
-        if saved == max_to_save:
-            break
-    
-    print(f"Finished saving {saved} non-empty transformed samples. Exiting before training.")
-    return    
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
