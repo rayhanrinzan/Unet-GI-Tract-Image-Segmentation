@@ -11,52 +11,6 @@ This version is converted from a Colab notebook into a normal Python script:
 
 #for visualizing scans/masks
 import matplotlib.pyplot as plt
-train_dataset = CustomDataset(
-    train_pairs,
-    eval_transform if args.no_augment else train_transform,
-    mask_data_cache=mask_dfs_cache,
-)
-val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-# TEMP DEBUG BLOCK: visualize a few transformed samples, then exit
-for i in range(4):
-    img, mask = train_dataset[i]
-
-    img_np = img.squeeze().cpu().numpy()
-    mask_np = mask.cpu().numpy()
-
-    print(f"\nSample {i}")
-    print(f"Image shape: {img.shape}")
-    print(f"Mask shape: {mask.shape}")
-    print(f"Image min/max: {img_np.min():.4f}, {img_np.max():.4f}")
-    print(f"Mask unique classes: {np.unique(mask_np)}")
-
-    masked_organ = np.ma.masked_where(mask_np == 0, mask_np)
-
-    plt.figure(figsize=(12, 4))
-
-    plt.subplot(1, 3, 1)
-    plt.imshow(img_np, cmap="gray")
-    plt.title("Transformed Image")
-    plt.axis("off")
-
-    plt.subplot(1, 3, 2)
-    plt.imshow(mask_np, cmap="tab10", vmin=0, vmax=NUM_CLASSES - 1)
-    plt.title("Transformed Mask")
-    plt.axis("off")
-
-    plt.subplot(1, 3, 3)
-    plt.imshow(img_np, cmap="gray")
-    plt.imshow(masked_organ, cmap="tab10", vmin=0, vmax=NUM_CLASSES - 1, alpha=0.45)
-    plt.title("Overlay")
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-print("Finished checking transformed samples. Exiting before training.")
-return
-#end of temporary debugging logic
 
 import argparse
 import os
@@ -272,6 +226,47 @@ def main():
     )
     val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
     test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+
+    # TEMP DEBUG BLOCK: visualize a few transformed samples, then exit
+    for i in range(4):
+        img, mask = train_dataset[i]
+    
+        img_np = img.squeeze().cpu().numpy()
+        mask_np = mask.cpu().numpy()
+    
+        print(f"\nSample {i}")
+        print(f"Image shape: {img.shape}")
+        print(f"Mask shape: {mask.shape}")
+        print(f"Image min/max: {img_np.min():.4f}, {img_np.max():.4f}")
+        print(f"Mask unique classes: {np.unique(mask_np)}")
+    
+        masked_organ = np.ma.masked_where(mask_np == 0, mask_np)
+    
+        plt.figure(figsize=(12, 4))
+    
+        plt.subplot(1, 3, 1)
+        plt.imshow(img_np, cmap="gray")
+        plt.title("Transformed Image")
+        plt.axis("off")
+    
+        plt.subplot(1, 3, 2)
+        plt.imshow(mask_np, cmap="tab10", vmin=0, vmax=NUM_CLASSES - 1)
+        plt.title("Transformed Mask")
+        plt.axis("off")
+    
+        plt.subplot(1, 3, 3)
+        plt.imshow(img_np, cmap="gray")
+        plt.imshow(masked_organ, cmap="tab10", vmin=0, vmax=NUM_CLASSES - 1, alpha=0.45)
+        plt.title("Overlay")
+        plt.axis("off")
+    
+        plt.tight_layout()
+        plt.show()
+    
+    print("Finished checking transformed samples. Exiting before training.")
+    return
+    #end of temporary debugging logic
+    
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
