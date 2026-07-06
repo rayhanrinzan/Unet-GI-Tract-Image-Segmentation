@@ -42,7 +42,7 @@ train_transform = v2.Compose([
 ])
 
 eval_transform = v2.Compose([
-    v2.Resize(IMAGE_SIZE, IMAGE_SIZE, antialias=True),
+    v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
 ])
 
 class CustomDataset(Dataset):
