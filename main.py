@@ -254,8 +254,6 @@ def main():
     val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
     test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
-    print("\n--- DATASET SANITY CHECK ---")
-
     for i in range(10):
         img, target = train_dataset[i]
         print(f"sample {i}")
