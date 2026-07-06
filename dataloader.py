@@ -11,7 +11,6 @@ from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
 
 
-RESIZE_SIZE = 286
 IMAGE_SIZE = 266
 NUM_CLASSES = 6  # background + 5 organ classes
 
@@ -32,8 +31,7 @@ def pixel_decoder(encoded_pixels, height, width):
 
 
 train_transform = v2.Compose([
-    v2.Resize((RESIZE_SIZE, RESIZE_SIZE), antialias=True),
-    v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE)),
+    v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
     v2.RandomRotation(
         degrees=(-10, 10),
         interpolation=InterpolationMode.BILINEAR,
@@ -44,8 +42,7 @@ train_transform = v2.Compose([
 ])
 
 eval_transform = v2.Compose([
-    v2.Resize((RESIZE_SIZE, RESIZE_SIZE), antialias=True),
-    v2.CenterCrop((IMAGE_SIZE, IMAGE_SIZE)),
+    v2.Resize(IMAGE_SIZE, IMAGE_SIZE, antialias=True),
 ])
 
 class CustomDataset(Dataset):
