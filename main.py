@@ -141,6 +141,8 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
             current = batch * len(x)
         
             predicted_classes = pred.argmax(1)
+            print("pred unique:", torch.unique(predicted_classes, return_counts=True))
+            print("true unique:", torch.unique(y, return_counts=True))
         
             intersection = ((predicted_classes == y) & (y > 0)).sum().item()
             union = ((predicted_classes > 0) | (y > 0)).sum().item()
@@ -262,9 +264,9 @@ def main():
         print("target unique:", torch.unique(target, return_counts=True))
         print()
     
-        print(f"Total train samples: {len(train_pairs)}")
-        print(f"Total validation samples: {len(val_pairs)}")
-        print(f"Total test samples: {len(test_pairs)}")
+    print(f"Total train samples: {len(train_pairs)}")
+    print(f"Total validation samples: {len(val_pairs)}")
+    print(f"Total test samples: {len(test_pairs)}")
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
