@@ -265,6 +265,17 @@ def main():
     print(f"Total train samples: {len(train_pairs)}")
     print(f"Total validation samples: {len(val_pairs)}")
     print(f"Total test samples: {len(test_pairs)}")
+    import matplotlib.pyplot as plt
+
+    img, target = train_dataset[0]
+    
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img.squeeze(), cmap="gray")
+    plt.imshow(target, alpha=0.4)
+    plt.title("Image + Label Map Overlay")
+    plt.axis("off")
+    plt.savefig(output_dir / "debug_overlay.png")
+    plt.close()
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
