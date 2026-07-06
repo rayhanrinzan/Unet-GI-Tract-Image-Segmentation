@@ -139,9 +139,24 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
         if batch % 100 == 0:
             loss_val = loss.item()
             current = batch * len(x)
-            print(f"loss: {loss_val:>7f}  [{current:>5d}/{size:>5d}]", flush=True)
-            maybe_log(wandb_run, {"Train/Step_Loss": loss_val})
-
+        
+            predicted_classes = pred.argmax(1)
+        
+            intersection = ((predicted_classes == y) & (y > 0)).sum().item()
+            union = ((predicted_classes > 0) | (y > 0)).sum().item()
+        
+            batch_iou = intersection / union if union > 0 else 0.0
+        
+            print(
+                f"loss: {loss_val:>7f}  IoU: {batch_iou:>7f}  [{current:>5d}/{size:>5d}]",
+                flush=True,
+            )
+        
+            maybe_log(wandb_run, {
+                "Train/Step_Loss": loss_val,
+                "Train/Step_IoU": batch_iou,
+            })
+            
     return train_loss / max(num_batches, 1)
 
 
