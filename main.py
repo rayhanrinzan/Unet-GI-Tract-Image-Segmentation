@@ -45,6 +45,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
@@ -80,37 +81,14 @@ def resolve_dataset_path(root_path):
 
     return dataset_path
 
-
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super().__init__()
-        self.smooth = smooth
-
-    def forward(self, inputs, targets):
-        inputs = F.softmax(inputs, dim=1)
-        num_classes = inputs.shape[1]
-        targets_one_hot = F.one_hot(targets.long(), num_classes=num_classes).permute(0, 3, 1, 2).float()
-
-        inputs = inputs.reshape(inputs.shape[0], inputs.shape[1], -1)
-        targets_one_hot = targets_one_hot.reshape(targets_one_hot.shape[0], targets_one_hot.shape[1], -1)
-
-        intersection = (inputs * targets_one_hot).sum(2)
-        dice = (2.0 * intersection + self.smooth) / (
-            inputs.sum(2) + targets_one_hot.sum(2) + self.smooth
-        )
-        return 1.0 - dice.mean()
-
-
 class CombinedLoss(nn.Module):
     def __init__(self, device):
         super().__init__()
-        self.dice = DiceLoss()
-        weights = torch.tensor([0.1, 1.0, 1.0, 1.0], device=device)
-        self.ce = nn.CrossEntropyLoss(weight=weights)
+        self.ce = nn.CrossEntropyLoss() 
 
     def forward(self, inputs, targets):
         target_long = targets.long()
-        return self.ce(inputs, target_long) + self.dice(inputs, target_long)
+        return self.ce(inputs, target_long)
 
 
 def maybe_log(wandb_run, metrics):
@@ -125,12 +103,13 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
     train_loss = 0.0
 
     for batch, (x, y) in enumerate(dataloader):
+        optimizer.zero_grad()
         x, y = x.to(device), y.to(device)
 
         pred = model(x)
         loss = loss_fn(pred, y)
 
-        optimizer.zero_grad()
+        
         loss.backward()
         optimizer.step()
 
@@ -291,7 +270,7 @@ def main():
     test_dataloader = DataLoader(test_dataset, shuffle=False, **dataloader_kwargs)
 
     model = UNet(in_channels=1, num_classes=NUM_CLASSES).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay = args.weight_decay)
     criterion = CombinedLoss(device=device)
 
     wandb_run = None
