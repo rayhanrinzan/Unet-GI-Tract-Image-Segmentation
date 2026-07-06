@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 
 IMAGE_SIZE = 266
-NUM_CLASSES = 6  # background + 5 organ classes
+NUM_CLASSES = 4  # background + 3 organ classes
 
 
 def pixel_decoder(encoded_pixels, height, width):
