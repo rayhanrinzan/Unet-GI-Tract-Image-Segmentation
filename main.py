@@ -227,6 +227,21 @@ def main():
     slice_contour_pairs = collect_slice_pairs(dataset_path)
     mask_dfs_cache = build_mask_cache(slice_contour_pairs)
     train_pairs, val_pairs, test_pairs = split_pairs_by_scan(slice_contour_pairs, args.seed)
+   
+    def has_eval_mask(pair):
+        slice_id, _, contour_csv_path = pair
+        df = mask_dfs_cache[contour_csv_path]
+        rows = df[df["SliceID"] == slice_id]
+    
+        # MaskTypeID: 1 large_bowel, 3 small_bowel, 4 stomach
+        rows = rows[rows["MaskTypeID"].isin([1, 3, 4])]
+    
+        return (rows["EncodedPixels"].astype(str) != "-1").any()
+    
+    train_pairs = [p for p in train_pairs if has_eval_mask(p)]
+    # temporarily trying to overfit
+    train_pairs = train_pairs[:64]
+    val_pairs = train_pairs[:64]
 
     print(f"Total train samples: {len(train_pairs)}")
     print(f"Total validation samples: {len(val_pairs)}")
