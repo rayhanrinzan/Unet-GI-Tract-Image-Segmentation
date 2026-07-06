@@ -242,7 +242,16 @@ def main():
     # temporarily trying to overfit
     train_pairs = train_pairs[:64]
     val_pairs = train_pairs[:64]
+
+    train_dataset = CustomDataset(
+        train_pairs,
+        eval_transform if args.no_augment else train_transform,
+        mask_data_cache=mask_dfs_cache,
+    )
     
+    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+
     print("\n--- DATASET SANITY CHECK ---")
 
     for i in range(10):
@@ -256,14 +265,6 @@ def main():
         print(f"Total train samples: {len(train_pairs)}")
         print(f"Total validation samples: {len(val_pairs)}")
         print(f"Total test samples: {len(test_pairs)}")
-
-    train_dataset = CustomDataset(
-        train_pairs,
-        eval_transform if args.no_augment else train_transform,
-        mask_data_cache=mask_dfs_cache,
-    )
-    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
     dataloader_kwargs = {
         "batch_size": args.batch_size,
