@@ -164,7 +164,8 @@ def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_
             total_correct_pixels += (predicted_classes == y).sum().item()
             total_pixels += y.numel()
 
-            for cls in range(1, NUM_CLASSES):
+            EVAL_CLASSES = [2, 4, 5]
+            for cls in EVAL_CLASSES:    
                 inter = ((predicted_classes == cls) & (y == cls)).sum().item()
                 union = ((predicted_classes == cls) | (y == cls)).sum().item()
                 if union > 0:
