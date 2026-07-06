@@ -6,13 +6,23 @@ import pandas as pd
 import torch
 import torchvision.transforms.v2 as v2
 from torchvision import tv_tensors
-from torchvision.transforms import InterpolationMode
 from torch.utils.data.dataset import Dataset
 from tqdm import tqdm
 
 
 IMAGE_SIZE = 266
-NUM_CLASSES = 3
+
+# 0 = background
+# 1 = large_bowel
+# 2 = small_bowel
+# 3 = stomach
+NUM_CLASSES = 4
+
+EVAL_CLASS_MAP = {
+    1: 1,  # MaskTypeID 1 = large_bowel
+    3: 2,  # MaskTypeID 3 = small_bowel
+    4: 3,  # MaskTypeID 4 = stomach
+}
 
 
 def pixel_decoder(encoded_pixels, height, width):
@@ -32,11 +42,6 @@ def pixel_decoder(encoded_pixels, height, width):
 
 train_transform = v2.Compose([
     v2.Resize((IMAGE_SIZE, IMAGE_SIZE), antialias=True),
-    v2.RandomRotation(
-        degrees=(-10, 10),
-        interpolation=InterpolationMode.BILINEAR,
-        fill={tv_tensors.Image: 0.0, tv_tensors.Mask: 0},
-    ),
     v2.RandomHorizontalFlip(p=0.3),
     v2.RandomVerticalFlip(p=0.3),
 ])
@@ -76,16 +81,25 @@ class CustomDataset(Dataset):
     
         df = self.mask_data_cache[contour_csv_path]
         slice_rows = df[df["SliceID"] == slice_id]
-    
+
         label_map = np.zeros((height, width), dtype=np.int64)
-    
+
         for _, row in slice_rows.iterrows():
+            mask_type_id = int(row["MaskTypeID"])
             encoded_pixels = row["EncodedPixels"]
-    
-            if str(encoded_pixels) != "-1":
-                mask_2d = pixel_decoder(encoded_pixels, height, width)
-                organ_id = int(row["MaskTypeID"]) + 1
-                label_map[mask_2d == 1] = organ_id
+        
+            # Ignore ampulla_of_vater and pyloric_sphincter for now.
+            # Keep only large_bowel, small_bowel, stomach.
+            if mask_type_id not in EVAL_CLASS_MAP:
+                continue
+        
+            if pd.isna(encoded_pixels) or str(encoded_pixels) == "-1":
+                continue
+        
+            mask_2d = pixel_decoder(encoded_pixels, height, width)
+            class_id = EVAL_CLASS_MAP[mask_type_id]
+            label_map[mask_2d == 1] = class_id
+
     
         img = tv_tensors.Image(torch.from_numpy(img).unsqueeze(0))
         target = tv_tensors.Mask(torch.from_numpy(label_map))
