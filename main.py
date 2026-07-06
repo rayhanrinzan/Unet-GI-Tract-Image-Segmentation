@@ -105,7 +105,7 @@ class CombinedLoss(nn.Module):
     def __init__(self, device):
         super().__init__()
         self.dice = DiceLoss()
-        weights = torch.tensor([0.1, 1.0, 1.0, 1.0, 1.0, 1.0], device=device)
+        weights = torch.tensor([0.001, 2.0, 10.0, 2.0, 10.0, 10.0], device=device)
         self.ce = nn.CrossEntropyLoss(weight=weights)
 
     def forward(self, inputs, targets):
@@ -136,7 +136,7 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
 
         train_loss += loss.item()
 
-        if batch % 100 == 0:
+        if batch % 1 == 0:
             loss_val = loss.item()
             current = batch * len(x)
         
