@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Experimental reference-style loader for GI tract MRI segmentation.
+"""Reference baseline reproduction for GI tract MRI segmentation on Slurm.
 
-This file keeps my existing split/Slurm/main structure, but comments out
-my original CustomDataset path and uses a reference-style image/mask/dataset pipeline:
+This script keeps the command-line style from my original main.py, but follows
+the reference notebook's baseline much more closely:
 
-- image_path + mask_path dataframe
-- precomputed .npy masks
-- RGB image loading like the reference notebook
-- [3, H, W] binary masks for large_bowel, small_bowel, stomach
-- BCEWithLogitsLoss + sigmoid predictions
+- segmentation_models_pytorch U-Net
+- EfficientNet encoder with ImageNet weights by default
+- RGB image loading from grayscale MRI slices
+- [3, H, W] multilabel masks for large_bowel, small_bowel, stomach
+- sigmoid-style predictions, not argmax
+- SoftBCEWithLogitsLoss + TverskyLoss
+- StratifiedGroupKFold split by empty/non-empty masks and patient case
 """
 
 import argparse
+import copy
+import gc
 import os
 import random
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import cv2
@@ -21,38 +27,37 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch import optim
-from torch.utils.data import DataLoader
+import torch.optim as optim
+from sklearn.model_selection import StratifiedGroupKFold
+from torch.cuda import amp
+from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
-# EDIT 1:
-# Old import commented out because this experiment does NOT use my CustomDataset,
-# NUM_CLASSES, train_transform, or eval_transform.
-#
-# from dataloader import (
-#     NUM_CLASSES,
-#     CustomDataset,
-#     build_mask_cache,
-#     collect_slice_pairs,
-#     train_transform,
-#     eval_transform,
-#     split_pairs_by_scan,
-# )
-
-# Keep only my metadata/split helpers.
-from dataloader import (
-    build_mask_cache,
-    collect_slice_pairs,
-    split_pairs_by_scan,
-)
-
-from model import UNet
+import albumentations as A
+import segmentation_models_pytorch as smp
 
 
-REFERENCE_NUM_CLASSES = 3  # large_bowel, small_bowel, stomach
+CLASS_NAMES = ["large_bowel", "small_bowel", "stomach"]
+NUM_CLASSES = 3
+
+# Dataset MaskTypeID mapping:
+# 1 = large_bowel
+# 3 = small_bowel
+# 4 = stomach
+CHANNEL_MAP = {
+    1: 0,
+    3: 1,
+    4: 2,
+}
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train U-Net on GI tract MRI segmentation data")
+    parser = argparse.ArgumentParser(
+        description="Reference-style U-Net baseline for GI tract MRI segmentation"
+    )
+
+    # Same core arguments as my original main.py
     parser.add_argument(
         "--dataset-root",
         type=str,
@@ -68,36 +73,51 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--no-augment",
-        action="store_true",
-        help="Kept for CLI compatibility; this reference loader uses no transforms.",
-    )
+    parser.add_argument("--no-augment", action="store_true", help="Disable data augmentation")
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="MRI Scans 5")
     parser.add_argument("--wandb-run-name", type=str, default=None)
 
-    # For this experiment, skip full test by default so I do not generate thousands
-    # of .npy masks every quick debug run.
+    # Reference-baseline options
+    parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument("--n-folds", type=int, default=5)
+    parser.add_argument("--encoder-name", type=str, default="efficientnet-b1")
+    parser.add_argument("--encoder-weights", type=str, default="imagenet")
+    parser.add_argument("--weight-decay", type=float, default=1e-6)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument(
-        "--run-test",
-        action="store_true",
-        help="Generate reference masks for the full test split and evaluate it.",
+        "--scheduler",
+        type=str,
+        default="CosineAnnealingLR",
+        choices=["CosineAnnealingLR", "CosineAnnealingWarmRestarts", "ReduceLROnPlateau", "ExponentialLR", "None"],
+    )
+    parser.add_argument("--debug", action="store_true", help="Use a small non-empty subset for quick debugging")
+    parser.add_argument("--train-limit", type=int, default=None, help="Optional limit for training samples")
+    parser.add_argument("--valid-limit", type=int, default=None, help="Optional limit for validation samples")
+    parser.add_argument(
+        "--mask-cache-dir",
+        type=str,
+        default=None,
+        help="Folder for generated .npy masks. Defaults to output_dir/reference_masks.",
     )
 
     return parser.parse_args()
 
 
-def set_seed(seed):
-    random.seed(seed)
+def set_seed(seed=42):
     np.random.seed(seed)
+    random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    print("> SEEDING DONE")
 
 
 def resolve_dataset_path(root_path):
-    """Resolve dataset path assuming folder name 'dataset' when root_path is its parent."""
     if not root_path:
         raise ValueError(
             "No dataset path provided. Set GI_TRACT_DATASET_PATH or pass --dataset-root. "
@@ -116,134 +136,142 @@ def resolve_dataset_path(root_path):
     return dataset_path
 
 
-# EDIT 2:
-# Reference notebook image/mask/RLE sections pasted here.
-# This keeps the reference-style RGB image loading and .npy mask loading.
-
-def load_img(path):
-    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Could not read image: {path}")
-
-    img = np.tile(img[..., None], [1, 1, 3])  # gray to RGB, same as reference notebook
-    img = img.astype("float32")  # original is uint16
-
-    mx = np.max(img)
-    if mx:
-        img /= mx  # scale image to [0, 1]
-
-    return img
-
-
-def load_msk(path):
-    msk = np.load(path)
-    msk = msk.astype("float32")
-    msk /= 255.0
-    return msk
-
-
 def rle_decode(mask_rle, shape):
-    """
-    mask_rle: run-length as string formatted as start length
-    shape: (height, width)
-    returns: binary numpy array, 1 = mask, 0 = background
-    """
+    """Decode run-length encoding into a binary mask."""
     s = str(mask_rle).split()
+
+    if len(s) == 0:
+        return np.zeros(shape, dtype=np.uint8)
+
     starts, lengths = [np.asarray(x, dtype=int) for x in (s[0:][::2], s[1:][::2])]
 
     starts -= 1
     ends = starts + lengths
 
     img = np.zeros(shape[0] * shape[1], dtype=np.uint8)
+
     for lo, hi in zip(starts, ends):
         img[lo:hi] = 1
 
     return img.reshape(shape)
 
 
-# EDIT 3:
-# Bridge from my current slice_contour_pairs + masks_rle.csv setup
-# into the reference notebook's expected dataframe format:
-# image_path + mask_path.
-#
-# This is the only custom bridge code needed because the reference notebook used
-# a separate precomputed .npy mask dataset, while this repo currently has RLE CSVs.
+def load_img(path):
+    """Load grayscale MRI slice as 3-channel RGB-style image."""
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
 
-def build_reference_mask(slice_id, contour_csv_path, height, width, mask_dfs_cache):
-    df = mask_dfs_cache[contour_csv_path]
-    rows = df[df["SliceID"] == slice_id]
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
 
-    # [H, W, 3]
-    # channel 0 = large_bowel
-    # channel 1 = small_bowel
-    # channel 2 = stomach
-    mask = np.zeros((height, width, REFERENCE_NUM_CLASSES), dtype=np.uint8)
+    img = np.tile(img[..., None], [1, 1, 3])
+    img = img.astype("float32")
 
-    channel_map = {
-        1: 0,  # large_bowel
-        3: 1,  # small_bowel
-        4: 2,  # stomach
-    }
+    mx = np.max(img)
+    if mx:
+        img /= mx
 
-    for _, row in rows.iterrows():
-        mask_type_id = int(row["MaskTypeID"])
-        encoded_pixels = row["EncodedPixels"]
-
-        if mask_type_id not in channel_map:
-            continue
-
-        if pd.isna(encoded_pixels) or str(encoded_pixels) == "-1":
-            continue
-
-        channel = channel_map[mask_type_id]
-        mask[..., channel] = rle_decode(str(encoded_pixels), (height, width)) * 255
-
-    return mask
+    return img
 
 
-def make_reference_df(pairs, mask_dfs_cache, output_dir, split_name):
-    mask_dir = output_dir / "reference_masks" / split_name
-    mask_dir.mkdir(parents=True, exist_ok=True)
+def load_msk(path):
+    """Load precomputed 3-channel .npy mask."""
+    msk = np.load(path)
+    msk = msk.astype("float32")
+    msk /= 255.0
+    return msk
 
+
+def collect_reference_rows(dataset_path, mask_cache_dir):
+    """Build a reference-style dataframe and generate .npy masks from the RLE CSVs."""
     rows = []
+    mask_cache_dir.mkdir(parents=True, exist_ok=True)
 
-    for idx, (slice_id, slice_path, contour_csv_path) in enumerate(pairs):
-        img = cv2.imread(str(slice_path), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f"Skipping unreadable image: {slice_path}")
+    case_paths = sorted(Path(dataset_path).iterdir())
+
+    for case_path in tqdm(case_paths, desc="Scanning cases"):
+        if not case_path.is_dir():
             continue
 
-        height, width = img.shape[:2]
+        case_name = case_path.name
+        case_number = "".join(ch for ch in case_name if ch.isdigit())
 
-        mask = build_reference_mask(
-            slice_id=slice_id,
-            contour_csv_path=contour_csv_path,
-            height=height,
-            width=width,
-            mask_dfs_cache=mask_dfs_cache,
-        )
+        for case_day_path in sorted(case_path.iterdir()):
+            if not case_day_path.is_dir():
+                continue
 
-        # Include idx to avoid collisions across case/day folders with the same slice filename.
-        mask_path = mask_dir / f"{idx:06d}_{slice_path.stem}.npy"
-        np.save(mask_path, mask)
+            scans_path = case_day_path / "scans"
+            contours_path = case_day_path / "contours"
 
-        rows.append({
-            "id": f"{contour_csv_path.parent.parent.parent.name}_{contour_csv_path.parent.parent.name}_{slice_id}",
-            "image_path": str(slice_path),
-            "mask_path": str(mask_path),
-            "height": height,
-            "width": width,
-            "empty": mask.sum() == 0,
-        })
+            contour_csv_path = contours_path / "masks_rle.csv"
+            if not contour_csv_path.is_file():
+                contour_csv_path = contours_path / "mask_rle.csv"
 
-    return pd.DataFrame(rows)
+            if not scans_path.is_dir() or not contour_csv_path.is_file():
+                continue
+
+            mask_df = pd.read_csv(contour_csv_path)
+
+            for scan_path in sorted(scans_path.iterdir()):
+                if not scan_path.is_file():
+                    continue
+
+                slice_parts = scan_path.name.split("_")
+                if len(slice_parts) < 2:
+                    continue
+
+                slice_id = slice_parts[0] + "_" + slice_parts[1]
+
+                img = cv2.imread(str(scan_path), cv2.IMREAD_UNCHANGED)
+                if img is None:
+                    print(f"Skipping unreadable image: {scan_path}")
+                    continue
+
+                height, width = img.shape[:2]
+                slice_rows = mask_df[mask_df["SliceID"] == slice_id]
+
+                mask = np.zeros((height, width, NUM_CLASSES), dtype=np.uint8)
+
+                for _, row in slice_rows.iterrows():
+                    mask_type_id = int(row["MaskTypeID"])
+                    encoded_pixels = row["EncodedPixels"]
+
+                    if mask_type_id not in CHANNEL_MAP:
+                        continue
+
+                    if pd.isna(encoded_pixels) or str(encoded_pixels) == "-1":
+                        continue
+
+                    channel = CHANNEL_MAP[mask_type_id]
+                    mask[..., channel] = rle_decode(str(encoded_pixels), (height, width)) * 255
+
+                relative_key = f"{case_name}_{case_day_path.name}_{scan_path.stem}"
+                mask_path = mask_cache_dir / f"{relative_key}.npy"
+                np.save(mask_path, mask)
+
+                rows.append(
+                    {
+                        "id": f"{case_day_path.name}_{slice_id}",
+                        "case": int(case_number) if case_number else -1,
+                        "case_name": case_name,
+                        "day_name": case_day_path.name,
+                        "slice_id": slice_id,
+                        "image_path": str(scan_path),
+                        "mask_path": str(mask_path),
+                        "height": height,
+                        "width": width,
+                        "empty": bool(mask.sum() == 0),
+                    }
+                )
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        raise ValueError(f"No usable image/mask rows found inside: {dataset_path}")
+
+    return df
 
 
-# EDIT 4:
-# Reference notebook dataset section pasted here.
-# It expects a dataframe with image_path and mask_path columns.
-
-class BuildDataset(torch.utils.data.Dataset):
+class BuildDataset(Dataset):
     def __init__(self, df, label=True, transforms=None):
         self.df = df
         self.label = label
@@ -280,139 +308,421 @@ class BuildDataset(torch.utils.data.Dataset):
         return torch.tensor(img)
 
 
-# EDIT 5:
-# Old softmax/CrossEntropy/DiceLoss setup is intentionally not used in this file.
-# The reference-style mask format is [B, 3, H, W], so the compatible loss is BCEWithLogitsLoss.
-#
-# Old DiceLoss and CombinedLoss are left out instead of copied/commented to keep
-# this experimental file easy to run.
+def get_transforms(img_size, no_augment=False):
+    valid_tfms = A.Compose(
+        [
+            A.Resize(img_size, img_size, interpolation=cv2.INTER_NEAREST),
+        ],
+        p=1.0,
+    )
+
+    if no_augment:
+        return valid_tfms, valid_tfms
+
+    train_tfms = A.Compose(
+        [
+            A.Resize(img_size, img_size, interpolation=cv2.INTER_NEAREST),
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.0625,
+                scale_limit=0.05,
+                rotate_limit=10,
+                p=0.5,
+            ),
+            A.OneOf(
+                [
+                    A.GridDistortion(num_steps=5, distort_limit=0.05, p=1.0),
+                    A.ElasticTransform(alpha=1, sigma=50, p=1.0),
+                ],
+                p=0.25,
+            ),
+            A.CoarseDropout(
+                max_holes=8,
+                max_height=img_size // 20,
+                max_width=img_size // 20,
+                min_holes=5,
+                fill_value=0,
+                mask_fill_value=0,
+                p=0.5,
+            ),
+        ],
+        p=1.0,
+    )
+
+    return train_tfms, valid_tfms
+
+
+def create_folds(df, n_folds, seed):
+    skf = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+
+    df = df.copy()
+    df["fold"] = -1
+
+    for fold, (_, val_idx) in enumerate(skf.split(df, df["empty"], groups=df["case_name"])):
+        df.loc[val_idx, "fold"] = fold
+
+    return df
+
+
+def prepare_loaders(df, fold, args):
+    train_df = df.query("fold != @fold").reset_index(drop=True)
+    valid_df = df.query("fold == @fold").reset_index(drop=True)
+
+    if args.debug:
+        train_df = train_df.query("empty == False").head(160).reset_index(drop=True)
+        valid_df = valid_df.query("empty == False").head(96).reset_index(drop=True)
+
+    if args.train_limit is not None:
+        train_df = train_df.head(args.train_limit).reset_index(drop=True)
+
+    if args.valid_limit is not None:
+        valid_df = valid_df.head(args.valid_limit).reset_index(drop=True)
+
+    train_tfms, valid_tfms = get_transforms(args.img_size, no_augment=args.no_augment)
+
+    train_dataset = BuildDataset(train_df, transforms=train_tfms)
+    valid_dataset = BuildDataset(valid_df, transforms=valid_tfms)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    valid_loader = DataLoader(
+        valid_dataset,
+        batch_size=args.batch_size * 2,
+        num_workers=args.num_workers,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        persistent_workers=args.num_workers > 0,
+    )
+
+    return train_loader, valid_loader, train_df, valid_df
+
+
+def build_model(args, device):
+    model = smp.Unet(
+        encoder_name=args.encoder_name,
+        encoder_weights=args.encoder_weights,
+        in_channels=3,
+        classes=NUM_CLASSES,
+        activation=None,
+    )
+    model.to(device)
+    return model
+
+
+JaccardLoss = smp.losses.JaccardLoss(mode="multilabel")
+DiceLoss = smp.losses.DiceLoss(mode="multilabel")
+BCELoss = smp.losses.SoftBCEWithLogitsLoss()
+LovaszLoss = smp.losses.LovaszLoss(mode="multilabel", per_image=False)
+TverskyLoss = smp.losses.TverskyLoss(mode="multilabel", log_loss=False)
+
+
+def criterion(y_pred, y_true):
+    return 0.5 * BCELoss(y_pred, y_true) + 0.5 * TverskyLoss(y_pred, y_true)
+
+
+def dice_coef(y_true, y_pred, thr=0.5, dim=(2, 3), epsilon=0.001):
+    y_true = y_true.to(torch.float32)
+    y_pred = (y_pred > thr).to(torch.float32)
+
+    inter = (y_true * y_pred).sum(dim=dim)
+    den = y_true.sum(dim=dim) + y_pred.sum(dim=dim)
+
+    dice = ((2 * inter + epsilon) / (den + epsilon)).mean(dim=(1, 0))
+    return dice
+
+
+def iou_coef(y_true, y_pred, thr=0.5, dim=(2, 3), epsilon=0.001):
+    y_true = y_true.to(torch.float32)
+    y_pred = (y_pred > thr).to(torch.float32)
+
+    inter = (y_true * y_pred).sum(dim=dim)
+    union = (y_true + y_pred - y_true * y_pred).sum(dim=dim)
+
+    iou = ((inter + epsilon) / (union + epsilon)).mean(dim=(1, 0))
+    return iou
+
+
+def fetch_scheduler(optimizer, args, train_loader_len):
+    scheduler_name = args.scheduler
+
+    if scheduler_name == "None":
+        return None
+
+    if scheduler_name == "CosineAnnealingLR":
+        t_max = int(train_loader_len * args.epochs) + 50
+        return lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=args.min_lr,
+        )
+
+    if scheduler_name == "CosineAnnealingWarmRestarts":
+        return lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=25,
+            eta_min=args.min_lr,
+        )
+
+    if scheduler_name == "ReduceLROnPlateau":
+        return lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.1,
+            patience=7,
+            threshold=0.0001,
+            min_lr=args.min_lr,
+        )
+
+    if scheduler_name == "ExponentialLR":
+        return lr_scheduler.ExponentialLR(optimizer, gamma=0.85)
+
+    return None
+
 
 def maybe_log(wandb_run, metrics):
     if wandb_run is not None:
         wandb_run.log(metrics)
 
 
-def multilabel_iou(pred_masks, y):
-    """
-    pred_masks and y: [B, 3, H, W]
-    returns mean IoU across channels that have nonzero union.
-    """
-    intersection = (pred_masks * y).sum(dim=(0, 2, 3))
-    union = ((pred_masks + y) > 0).float().sum(dim=(0, 2, 3))
-
-    valid = union > 0
-    if valid.any():
-        return (intersection[valid] / union[valid]).mean().item()
-
-    return 0.0
-
-
-# EDIT 6:
-# Training loop now uses sigmoid thresholding instead of argmax.
-
-def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=None):
-    size = len(dataloader.dataset)
-    num_batches = len(dataloader)
-
+def train_one_epoch(model, optimizer, scheduler, dataloader, device, epoch, wandb_run=None):
     model.train()
-    train_loss = 0.0
 
-    for batch, (x, y) in enumerate(dataloader):
-        x, y = x.to(device), y.to(device)
+    scaler = amp.GradScaler(enabled=(device == "cuda"))
 
-        pred = model(x)
-        loss = loss_fn(pred, y.float())
+    dataset_size = 0
+    running_loss = 0.0
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Train ")
 
-        train_loss += loss.item()
+    for step, (images, masks) in pbar:
+        images = images.to(device, dtype=torch.float)
+        masks = masks.to(device, dtype=torch.float)
 
-        if batch % 1 == 0:
-            loss_val = loss.item()
-            current = batch * len(x)
+        batch_size = images.size(0)
 
-            pred_masks = (torch.sigmoid(pred) > 0.5).float()
-            batch_iou = multilabel_iou(pred_masks, y)
+        with amp.autocast(enabled=(device == "cuda")):
+            y_pred = model(images)
+            loss = criterion(y_pred, masks)
 
-            print("pred channel sums:", pred_masks.sum(dim=(0, 2, 3)).detach().cpu())
-            print("true channel sums:", y.sum(dim=(0, 2, 3)).detach().cpu())
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-            print(
-                f"loss: {loss_val:>7f}  IoU: {batch_iou:>7f}  [{current:>5d}/{size:>5d}]",
-                flush=True,
-            )
+        optimizer.zero_grad(set_to_none=True)
 
-            maybe_log(wandb_run, {
-                "Train/Step_Loss": loss_val,
-                "Train/Step_IoU": batch_iou,
-            })
+        if scheduler is not None and not isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+            scheduler.step()
 
-    return train_loss / max(num_batches, 1)
+        running_loss += loss.item() * batch_size
+        dataset_size += batch_size
+
+        epoch_loss = running_loss / dataset_size
+
+        mem = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        probs = torch.sigmoid(y_pred.detach())
+        batch_iou = iou_coef(masks.detach(), probs).detach().cpu().item()
+
+        pbar.set_postfix(
+            train_loss=f"{epoch_loss:0.4f}",
+            train_iou=f"{batch_iou:0.4f}",
+            lr=f"{current_lr:0.5f}",
+            gpu_mem=f"{mem:0.2f} GB",
+        )
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    maybe_log(wandb_run, {"Train Loss": epoch_loss, "epoch": epoch})
+
+    return epoch_loss
 
 
-# EDIT 7:
-# Evaluation also uses sigmoid thresholding and reports per-channel IoU.
-
-def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_run=None):
-    num_batches = len(dataloader)
-
+@torch.no_grad()
+def valid_one_epoch(model, dataloader, device, epoch, wandb_run=None):
     model.eval()
 
-    total_loss = 0.0
-    total_correct_pixels = 0
-    total_pixels = 0
+    dataset_size = 0
+    running_loss = 0.0
+    val_scores = []
 
-    iou_sum = torch.zeros(REFERENCE_NUM_CLASSES, device=device)
-    iou_count = torch.zeros(REFERENCE_NUM_CLASSES, device=device)
+    pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc="Valid ")
 
-    with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
+    for step, (images, masks) in pbar:
+        images = images.to(device, dtype=torch.float)
+        masks = masks.to(device, dtype=torch.float)
 
-            pred = model(x)
-            total_loss += loss_fn(pred, y.float()).item()
+        batch_size = images.size(0)
 
-            pred_masks = (torch.sigmoid(pred) > 0.5).float()
+        y_pred = model(images)
+        loss = criterion(y_pred, masks)
 
-            total_correct_pixels += (pred_masks == y).sum().item()
-            total_pixels += y.numel()
+        running_loss += loss.item() * batch_size
+        dataset_size += batch_size
 
-            intersection = (pred_masks * y).sum(dim=(0, 2, 3))
-            union = ((pred_masks + y) > 0).float().sum(dim=(0, 2, 3))
+        epoch_loss = running_loss / dataset_size
 
-            valid = union > 0
-            iou_sum[valid] += intersection[valid] / union[valid]
-            iou_count[valid] += 1
+        y_pred = nn.Sigmoid()(y_pred)
+        val_dice = dice_coef(masks, y_pred).cpu().detach().numpy()
+        val_jaccard = iou_coef(masks, y_pred).cpu().detach().numpy()
 
-    avg_loss = total_loss / max(num_batches, 1)
-    pixel_acc = total_correct_pixels / max(total_pixels, 1)
+        val_scores.append([val_dice, val_jaccard])
 
-    per_class_iou = iou_sum / torch.clamp(iou_count, min=1)
-    avg_iou = per_class_iou.mean().item()
+        mem = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0
+        pbar.set_postfix(
+            valid_loss=f"{epoch_loss:0.4f}",
+            valid_dice=f"{float(val_dice):0.4f}",
+            valid_iou=f"{float(val_jaccard):0.4f}",
+            gpu_memory=f"{mem:0.2f} GB",
+        )
 
-    print(f"{split_name} results:")
-    print(f"  Avg loss: {avg_loss:>8f}")
-    print(f"  Pixel Accuracy: {(100 * pixel_acc):>0.2f}%")
-    print(f"  Large Bowel IoU: {per_class_iou[0].item():>8f}")
-    print(f"  Small Bowel IoU: {per_class_iou[1].item():>8f}")
-    print(f"  Stomach IoU: {per_class_iou[2].item():>8f}")
-    print(f"  Mean IoU: {avg_iou:>8f}\n", flush=True)
+    val_scores = np.mean(val_scores, axis=0)
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    val_dice, val_jaccard = val_scores
 
     maybe_log(
         wandb_run,
         {
-            f"{split_name}/Epoch_Loss": avg_loss,
-            f"{split_name}/Pixel_Accuracy": pixel_acc,
-            f"{split_name}/Large_Bowel_IoU": per_class_iou[0].item(),
-            f"{split_name}/Small_Bowel_IoU": per_class_iou[1].item(),
-            f"{split_name}/Stomach_IoU": per_class_iou[2].item(),
-            f"{split_name}/Mean_IoU": avg_iou,
+            "Valid Loss": epoch_loss,
+            "Valid Dice": float(val_dice),
+            "Valid Jaccard": float(val_jaccard),
+            "epoch": epoch,
         },
     )
 
-    return avg_loss
+    return epoch_loss, val_scores
+
+
+def save_debug_overlay(dataset, output_dir):
+    if len(dataset) == 0:
+        return
+
+    import matplotlib.pyplot as plt
+
+    img, mask = dataset[0]
+
+    img_np = img.permute(1, 2, 0).numpy()
+    mask_np = mask.sum(dim=0).numpy()
+
+    plt.figure(figsize=(6, 6))
+    plt.imshow(img_np)
+    plt.imshow(mask_np, alpha=0.4)
+    plt.title("Reference Baseline: Image + Mask Overlay")
+    plt.axis("off")
+
+    out_path = output_dir / "debug_reference_baseline_overlay.png"
+    plt.savefig(out_path)
+    plt.close()
+
+    print(f"Saved debug overlay to: {out_path}")
+
+
+def run_training(model, optimizer, scheduler, train_loader, valid_loader, device, args, output_dir, wandb_run=None):
+    start = time.time()
+
+    best_model_wts = copy.deepcopy(model.state_dict())
+    best_dice = -np.inf
+    best_jaccard = -np.inf
+    best_epoch = -1
+
+    history = defaultdict(list)
+
+    best_path = output_dir / f"reference_baseline_best_fold{args.fold}.pth"
+    last_path = output_dir / f"reference_baseline_last_fold{args.fold}.pth"
+
+    for epoch in range(1, args.epochs + 1):
+        gc.collect()
+
+        print(f"\nEpoch {epoch}/{args.epochs}")
+
+        train_loss = train_one_epoch(
+            model,
+            optimizer,
+            scheduler,
+            dataloader=train_loader,
+            device=device,
+            epoch=epoch,
+            wandb_run=wandb_run,
+        )
+
+        val_loss, val_scores = valid_one_epoch(
+            model,
+            valid_loader,
+            device=device,
+            epoch=epoch,
+            wandb_run=wandb_run,
+        )
+
+        val_dice, val_jaccard = val_scores
+
+        history["Train Loss"].append(train_loss)
+        history["Valid Loss"].append(val_loss)
+        history["Valid Dice"].append(float(val_dice))
+        history["Valid Jaccard"].append(float(val_jaccard))
+
+        if scheduler is not None and isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_loss)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        maybe_log(
+            wandb_run,
+            {
+                "LR": current_lr,
+                "Best Dice So Far": float(best_dice),
+                "Best Jaccard So Far": float(best_jaccard),
+            },
+        )
+
+        print(f"Valid Dice: {float(val_dice):0.4f} | Valid Jaccard: {float(val_jaccard):0.4f}")
+
+        if val_dice >= best_dice:
+            print(f"Valid Dice improved ({best_dice:0.4f} -> {float(val_dice):0.4f})")
+            best_dice = float(val_dice)
+            best_jaccard = float(val_jaccard)
+            best_epoch = epoch
+            best_model_wts = copy.deepcopy(model.state_dict())
+
+            torch.save(model.state_dict(), best_path)
+            print(f"Saved best model to: {best_path}")
+
+            if wandb_run is not None:
+                wandb_run.summary["Best Dice"] = best_dice
+                wandb_run.summary["Best Jaccard"] = best_jaccard
+                wandb_run.summary["Best Epoch"] = best_epoch
+                wandb_run.save(str(best_path))
+
+        torch.save(model.state_dict(), last_path)
+
+    end = time.time()
+    time_elapsed = end - start
+
+    print(
+        "Training complete in {:.0f}h {:.0f}m {:.0f}s".format(
+            time_elapsed // 3600,
+            (time_elapsed % 3600) // 60,
+            (time_elapsed % 3600) % 60,
+        )
+    )
+    print(f"Best Dice: {best_dice:.4f}")
+    print(f"Best Jaccard: {best_jaccard:.4f}")
+    print(f"Best Epoch: {best_epoch}")
+
+    model.load_state_dict(best_model_wts)
+
+    return model, history
 
 
 def main():
@@ -423,121 +733,53 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_path = resolve_dataset_path(args.dataset_root)
+
+    if args.mask_cache_dir is None:
+        mask_cache_dir = output_dir / "reference_baseline_masks"
+    else:
+        mask_cache_dir = Path(args.mask_cache_dir).expanduser().resolve()
+
     print(f"Using dataset path: {dataset_path}")
     print(f"Saving outputs to: {output_dir}")
+    print(f"Saving generated masks to: {mask_cache_dir}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    slice_contour_pairs = collect_slice_pairs(dataset_path)
-    mask_dfs_cache = build_mask_cache(slice_contour_pairs)
-    train_pairs, val_pairs, test_pairs = split_pairs_by_scan(slice_contour_pairs, args.seed)
+    df = collect_reference_rows(dataset_path, mask_cache_dir)
 
-    def has_eval_mask(pair):
-        slice_id, _, contour_csv_path = pair
-        df = mask_dfs_cache[contour_csv_path]
-        rows = df[df["SliceID"] == slice_id]
+    print("\nDataset summary:")
+    print(df[["id", "case_name", "image_path", "mask_path", "empty"]].head())
+    print(df["empty"].value_counts())
 
-        # MaskTypeID: 1 large_bowel, 3 small_bowel, 4 stomach
-        rows = rows[rows["MaskTypeID"].isin([1, 3, 4])]
+    df = create_folds(df, args.n_folds, args.seed)
 
-        if rows.empty:
-            return False
+    print("\nFold distribution:")
+    print(df.groupby(["fold", "empty"])["id"].count())
 
-        encoded = rows["EncodedPixels"]
-        valid_encoded = encoded.notna() & (encoded.astype(str) != "-1")
-        return valid_encoded.any()
+    train_loader, valid_loader, train_df, valid_df = prepare_loaders(df, args.fold, args)
 
-    train_pairs = [p for p in train_pairs if has_eval_mask(p)]
-
-    # I am temporarily trying to overfit.
-    train_pairs = train_pairs[:64]
-    val_pairs = train_pairs[:64]
-
-    # EDIT 8:
-    # Old CustomDataset creation commented out.
-    #
-    # train_dataset = CustomDataset(
-    #     train_pairs,
-    #     eval_transform if args.no_augment else train_transform,
-    #     mask_data_cache=mask_dfs_cache,
-    # )
-    # val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-    # test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-
-    # New reference-style dataframe + BuildDataset creation.
-    train_df = make_reference_df(train_pairs, mask_dfs_cache, output_dir, split_name="train")
-    val_df = make_reference_df(val_pairs, mask_dfs_cache, output_dir, split_name="val")
-
-    if args.run_test:
-        test_df = make_reference_df(test_pairs, mask_dfs_cache, output_dir, split_name="test")
-    else:
-        print("Skipping full test mask generation for this debug run. Use --run-test to enable it.")
-        test_df = pd.DataFrame(columns=["id", "image_path", "mask_path", "height", "width", "empty"])
-
-    train_dataset = BuildDataset(train_df)
-    val_dataset = BuildDataset(val_df)
-    test_dataset = BuildDataset(test_df)
+    print(f"\nFold: {args.fold}")
+    print(f"Train samples: {len(train_df)}")
+    print(f"Valid samples: {len(valid_df)}")
 
     print("\n--- DATASET SANITY CHECK ---")
-    for i in range(min(10, len(train_dataset))):
-        img, target = train_dataset[i]
+    sample_dataset = train_loader.dataset
+
+    for i in range(min(10, len(sample_dataset))):
+        img, mask = sample_dataset[i]
         print(f"sample {i}")
         print("img shape:", img.shape)
-        print("target shape:", target.shape)
-        print("large_bowel pixels:", target[0].sum().item())
-        print("small_bowel pixels:", target[1].sum().item())
-        print("stomach pixels:", target[2].sum().item())
+        print("mask shape:", mask.shape)
+        print("large_bowel pixels:", mask[0].sum().item())
+        print("small_bowel pixels:", mask[1].sum().item())
+        print("stomach pixels:", mask[2].sum().item())
         print()
 
-    print(f"Total train samples: {len(train_dataset)}")
-    print(f"Total validation samples: {len(val_dataset)}")
-    print(f"Total test samples: {len(test_dataset)}")
-
-    # EDIT 9:
-    # Reference-style overlay debug image.
-    # Since masks are [3, H, W], sum across channels for an overlay.
-    if len(train_dataset) > 0:
-        import matplotlib.pyplot as plt
-
-        img, target = train_dataset[0]
-
-        plt.figure(figsize=(6, 6))
-        plt.imshow(img.permute(1, 2, 0).numpy())
-        plt.imshow(target.sum(dim=0).numpy(), alpha=0.4)
-        plt.title("Reference Loader: Image + Mask Overlay")
-        plt.axis("off")
-        plt.savefig(output_dir / "debug_reference_overlay.png")
-        plt.close()
-
-        print(f"Saved debug overlay to: {output_dir / 'debug_reference_overlay.png'}")
-
-    dataloader_kwargs = {
-        "batch_size": args.batch_size,
-        "num_workers": args.num_workers,
-        "pin_memory": device == "cuda",
-    }
-
-    if args.num_workers > 0:
-        dataloader_kwargs["persistent_workers"] = True
-        dataloader_kwargs["prefetch_factor"] = 2
-
-    train_dataloader = DataLoader(train_dataset, shuffle=True, **dataloader_kwargs)
-    val_dataloader = DataLoader(val_dataset, shuffle=False, **dataloader_kwargs)
-    test_dataloader = DataLoader(test_dataset, shuffle=False, **dataloader_kwargs)
-
-    # EDIT 10:
-    # Reference loader images are RGB [3, H, W], so in_channels=3.
-    # Reference masks are 3-channel foreground masks, so num_classes=3.
-    model = UNet(in_channels=3, num_classes=REFERENCE_NUM_CLASSES).to(device)
-
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-
-    # EDIT 11:
-    # Reference-style 3-channel binary target uses BCEWithLogitsLoss.
-    criterion = nn.BCEWithLogitsLoss()
+    save_debug_overlay(sample_dataset, output_dir)
 
     wandb_run = None
     if args.use_wandb:
@@ -545,62 +787,44 @@ def main():
 
         wandb_run = wandb.init(
             project=args.wandb_project,
-            name=args.wandb_run_name,
-            config={
-                "learning_rate": args.learning_rate,
-                "architecture": "UNet",
-                "dataset": "GI Tract Image Segmentation",
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "num_workers": args.num_workers,
-                "seed": args.seed,
-                "loader": "reference_style_npy_masks",
-                "num_classes": REFERENCE_NUM_CLASSES,
-                "input_channels": 3,
-            },
+            name=args.wandb_run_name
+            or f"reference-baseline-fold-{args.fold}-{args.encoder_name}-{args.img_size}",
+            config=vars(args),
         )
 
-    train_loss_history = []
-    val_loss_history = []
+    model = build_model(args, device)
 
-    best_val_loss = float("inf")
-    best_save_path = output_dir / "unet_reference_loader_best_model.pth"
-    final_save_path = output_dir / "unet_reference_loader_final_model.pth"
+    optimizer = optim.Adam(
+        model.parameters(),
+        lr=args.learning_rate,
+        weight_decay=args.weight_decay,
+    )
 
-    for epoch in range(args.epochs):
-        print(f"Epoch {epoch + 1}\n-------------------------------")
+    scheduler = fetch_scheduler(
+        optimizer,
+        args=args,
+        train_loader_len=len(train_loader),
+    )
 
-        train_loss = train_one_epoch(train_dataloader, model, criterion, optimizer, device, wandb_run)
-        train_loss_history.append(train_loss)
+    model, history = run_training(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        train_loader=train_loader,
+        valid_loader=valid_loader,
+        device=device,
+        args=args,
+        output_dir=output_dir,
+        wandb_run=wandb_run,
+    )
 
-        maybe_log(wandb_run, {"Train/Epoch_Loss": train_loss, "epoch": epoch + 1})
-
-        if len(val_dataloader) > 0:
-            val_loss = evaluate(val_dataloader, model, criterion, device, split_name="Validation", wandb_run=wandb_run)
-            val_loss_history.append(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                torch.save(model.state_dict(), best_save_path)
-                print(f"--> Validation loss improved to {best_val_loss:.6f}! Saved best model to {best_save_path}")
-        else:
-            print("Skipping validation: val_dataloader is empty.")
-
-    print("Training Done!\n")
-
-    print("-------------------------------\nFinal Evaluation on Test Set:")
-    if len(test_dataloader) > 0:
-        evaluate(test_dataloader, model, criterion, device, split_name="Test", wandb_run=wandb_run)
-    else:
-        print("Skipping test: test_dataloader is empty. Use --run-test to enable full test generation/evaluation.")
-
-    torch.save(model.state_dict(), final_save_path)
-    print(f"Final model weights saved to {final_save_path}")
+    history_df = pd.DataFrame(history)
+    history_path = output_dir / f"reference_baseline_history_fold{args.fold}.csv"
+    history_df.to_csv(history_path, index=False)
+    print(f"Saved history to: {history_path}")
 
     if wandb_run is not None:
-        wandb_run.save(str(final_save_path))
-        if best_save_path.exists():
-            wandb_run.save(str(best_save_path))
+        wandb_run.save(str(history_path))
         wandb_run.finish()
 
 
