@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Experimental reference-style loader for GI tract MRI segmentation.
 
-This file intentionally keeps your existing split/Slurm/main structure, but comments out
-your original CustomDataset path and uses a reference-style image/mask/dataset pipeline:
+This file keeps my existing split/Slurm/main structure, but comments out
+my original CustomDataset path and uses a reference-style image/mask/dataset pipeline:
 
 - image_path + mask_path dataframe
 - precomputed .npy masks
@@ -25,7 +25,7 @@ from torch import optim
 from torch.utils.data import DataLoader
 
 # EDIT 1:
-# Old import commented out because this experiment does NOT use your CustomDataset,
+# Old import commented out because this experiment does NOT use my CustomDataset,
 # NUM_CLASSES, train_transform, or eval_transform.
 #
 # from dataloader import (
@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader
 #     split_pairs_by_scan,
 # )
 
-# Keep only your metadata/split helpers.
+# Keep only my metadata/split helpers.
 from dataloader import (
     build_mask_cache,
     collect_slice_pairs,
@@ -57,8 +57,10 @@ def parse_args():
         "--dataset-root",
         type=str,
         default=os.environ.get("GI_TRACT_DATASET_PATH"),
-        help="Path to the dataset root. Can point either to the folder containing 'dataset/' or to 'dataset/' itself. "
-             "If omitted, GI_TRACT_DATASET_PATH is used.",
+        help=(
+            "Path to the dataset root. Can point either to the folder containing "
+            "'dataset/' or to 'dataset/' itself. If omitted, GI_TRACT_DATASET_PATH is used."
+        ),
     )
     parser.add_argument("--output-dir", type=str, default="outputs", help="Folder for saved models/logs")
     parser.add_argument("--epochs", type=int, default=10)
@@ -66,14 +68,22 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no-augment", action="store_true", help="Kept for CLI compatibility; this reference loader uses no transforms.")
+    parser.add_argument(
+        "--no-augment",
+        action="store_true",
+        help="Kept for CLI compatibility; this reference loader uses no transforms.",
+    )
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="MRI Scans 5")
     parser.add_argument("--wandb-run-name", type=str, default=None)
 
-    # For this experiment, skip full test by default so we do not generate thousands
+    # For this experiment, skip full test by default so I do not generate thousands
     # of .npy masks every quick debug run.
-    parser.add_argument("--run-test", action="store_true", help="Generate reference masks for the full test split and evaluate it.")
+    parser.add_argument(
+        "--run-test",
+        action="store_true",
+        help="Generate reference masks for the full test split and evaluate it.",
+    )
 
     return parser.parse_args()
 
@@ -109,7 +119,6 @@ def resolve_dataset_path(root_path):
 # EDIT 2:
 # Reference notebook image/mask/RLE sections pasted here.
 # This keeps the reference-style RGB image loading and .npy mask loading.
-
 
 def load_img(path):
     img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -153,13 +162,12 @@ def rle_decode(mask_rle, shape):
 
 
 # EDIT 3:
-# Bridge from your current slice_contour_pairs + masks_rle.csv setup
+# Bridge from my current slice_contour_pairs + masks_rle.csv setup
 # into the reference notebook's expected dataframe format:
 # image_path + mask_path.
 #
 # This is the only custom bridge code needed because the reference notebook used
-# a separate precomputed .npy mask dataset, while your repo currently has RLE CSVs.
-
+# a separate precomputed .npy mask dataset, while this repo currently has RLE CSVs.
 
 def build_reference_mask(slice_id, contour_csv_path, height, width, mask_dfs_cache):
     df = mask_dfs_cache[contour_csv_path]
@@ -235,7 +243,6 @@ def make_reference_df(pairs, mask_dfs_cache, output_dir, split_name):
 # Reference notebook dataset section pasted here.
 # It expects a dataframe with image_path and mask_path columns.
 
-
 class BuildDataset(torch.utils.data.Dataset):
     def __init__(self, df, label=True, transforms=None):
         self.df = df
@@ -280,7 +287,6 @@ class BuildDataset(torch.utils.data.Dataset):
 # Old DiceLoss and CombinedLoss are left out instead of copied/commented to keep
 # this experimental file easy to run.
 
-
 def maybe_log(wandb_run, metrics):
     if wandb_run is not None:
         wandb_run.log(metrics)
@@ -303,7 +309,6 @@ def multilabel_iou(pred_masks, y):
 
 # EDIT 6:
 # Training loop now uses sigmoid thresholding instead of argmax.
-
 
 def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=None):
     size = len(dataloader.dataset)
@@ -349,7 +354,6 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
 
 # EDIT 7:
 # Evaluation also uses sigmoid thresholding and reports per-channel IoU.
-
 
 def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_run=None):
     num_batches = len(dataloader)
@@ -443,11 +447,12 @@ def main():
             return False
 
         encoded = rows["EncodedPixels"]
-        return encoded.notna().any() and (encoded.astype(str) != "-1").any()
+        valid_encoded = encoded.notna() & (encoded.astype(str) != "-1")
+        return valid_encoded.any()
 
     train_pairs = [p for p in train_pairs if has_eval_mask(p)]
 
-    # temporarily trying to overfit
+    # I am temporarily trying to overfit.
     train_pairs = train_pairs[:64]
     val_pairs = train_pairs[:64]
 
