@@ -16,18 +16,19 @@ IMAGE_SIZE = 266
 NUM_CLASSES = 6  # background + 5 organ classes
 
 
-def pixel_decoder(encoded_pixels):
+def pixel_decoder(encoded_pixels, height, width):
     encoded_pixels = str(encoded_pixels).split()
     starts = [int(encoded_pixels[i]) for i in range(0, len(encoded_pixels), 2)]
     lengths = [int(encoded_pixels[i]) for i in range(1, len(encoded_pixels), 2)]
 
-    mask = np.zeros(IMAGE_SIZE * IMAGE_SIZE, dtype=np.uint8)
+    mask = np.zeros(height * width, dtype=np.uint8)
+
     for start, length in zip(starts, lengths):
         start_idx = start - 1
         end_idx = start_idx + length
         mask[start_idx:end_idx] = 1
 
-    return mask
+    return mask.reshape(height, width)
 
 
 train_transform = v2.Compose([
@@ -58,12 +59,13 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         slice_id, slice_path, contour_csv_path = self.slice_contour_pairs[idx]
+    
         img = cv2.imread(str(slice_path), cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"Could not read image: {slice_path}")
-
+    
         img = img.astype(np.float32)
-
+    
         # min-max normalization to get values in 0-1 range
         img_min = img.min()
         img_max = img.max()
@@ -71,29 +73,32 @@ class CustomDataset(Dataset):
             img = (img - img_min) / (img_max - img_min)
         else:
             img = np.zeros_like(img, dtype=np.float32)
-
+    
+        # IMPORTANT: use original image shape for RLE decoding
+        height, width = img.shape[:2]
+    
         df = self.mask_data_cache[contour_csv_path]
         slice_rows = df[df["SliceID"] == slice_id]
-
-        label_map = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=np.int64)
-
+    
+        label_map = np.zeros((height, width), dtype=np.int64)
+    
         for _, row in slice_rows.iterrows():
             encoded_pixels = row["EncodedPixels"]
+    
             if str(encoded_pixels) != "-1":
-                mask = pixel_decoder(encoded_pixels)
-                mask_2d = mask.reshape(IMAGE_SIZE, IMAGE_SIZE)
+                mask_2d = pixel_decoder(encoded_pixels, height, width)
                 organ_id = int(row["MaskTypeID"]) + 1
                 label_map[mask_2d == 1] = organ_id
-
+    
         img = tv_tensors.Image(torch.from_numpy(img).unsqueeze(0))
         target = tv_tensors.Mask(torch.from_numpy(label_map))
-        
+    
         if self.transform is not None:
             img, target = self.transform(img, target)
-        
+    
         img = img.as_subclass(torch.Tensor).float()
         target = target.as_subclass(torch.Tensor).long()
-        
+    
         return img, target
 
 
