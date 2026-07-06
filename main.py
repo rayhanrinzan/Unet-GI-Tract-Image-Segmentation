@@ -242,10 +242,20 @@ def main():
     # temporarily trying to overfit
     train_pairs = train_pairs[:64]
     val_pairs = train_pairs[:64]
+    
+    print("\n--- DATASET SANITY CHECK ---")
 
-    print(f"Total train samples: {len(train_pairs)}")
-    print(f"Total validation samples: {len(val_pairs)}")
-    print(f"Total test samples: {len(test_pairs)}")
+    for i in range(10):
+        img, target = train_dataset[i]
+        print(f"sample {i}")
+        print("img shape:", img.shape)
+        print("target shape:", target.shape)
+        print("target unique:", torch.unique(target, return_counts=True))
+        print()
+    
+        print(f"Total train samples: {len(train_pairs)}")
+        print(f"Total validation samples: {len(val_pairs)}")
+        print(f"Total test samples: {len(test_pairs)}")
 
     train_dataset = CustomDataset(
         train_pairs,
