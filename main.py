@@ -105,7 +105,7 @@ class CombinedLoss(nn.Module):
     def __init__(self, device):
         super().__init__()
         self.dice = DiceLoss()
-        weights = torch.tensor([0.001, 2.0, 10.0, 2.0, 10.0, 10.0], device=device)
+        weights = torch.tensor([0.1, 1.0, 1.0, 1.0], device=device)
         self.ce = nn.CrossEntropyLoss(weight=weights)
 
     def forward(self, inputs, targets):
@@ -181,7 +181,7 @@ def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_
             total_correct_pixels += (predicted_classes == y).sum().item()
             total_pixels += y.numel()
 
-            EVAL_CLASSES = [2, 4, 5]
+            EVAL_CLASSES = [1, 2, 3]
             for cls in EVAL_CLASSES:    
                 inter = ((predicted_classes == cls) & (y == cls)).sum().item()
                 union = ((predicted_classes == cls) | (y == cls)).sum().item()
