@@ -82,13 +82,33 @@ def resolve_dataset_path(root_path):
     return dataset_path
 
 class CombinedLoss(nn.Module):
-    def __init__(self, device):
+    def __init__(self, device, ce_weight=0.5, dice_weight=0.5, smooth=1e-6):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss() 
+        # EXPERIMENT: weighted CE + foreground Dice for sparse organ masks.
+        # To go back to the baseline, use nn.CrossEntropyLoss() and return only CE below.
+        class_weights = torch.tensor([0.05, 1.0, 1.5, 1.0], dtype=torch.float32, device=device)
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.smooth = smooth
 
     def forward(self, inputs, targets):
-        target_long = targets.long()
-        return self.ce(inputs, target_long)
+        targets = targets.long()
+        ce_loss = self.ce(inputs, targets)
+
+        probs = F.softmax(inputs, dim=1)
+        target_one_hot = F.one_hot(targets, num_classes=inputs.shape[1])
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+
+        # Dice is computed only on organ classes, not background, so it tracks IoU better.
+        probs_fg = probs[:, 1:]
+        target_fg = target_one_hot[:, 1:]
+        dims = (0, 2, 3)
+        intersection = (probs_fg * target_fg).sum(dims)
+        denominator = probs_fg.sum(dims) + target_fg.sum(dims)
+        dice_loss = 1.0 - ((2.0 * intersection + self.smooth) / (denominator + self.smooth)).mean()
+
+        return self.ce_weight * ce_loss + self.dice_weight * dice_loss
 
 
 def maybe_log(wandb_run, metrics):
@@ -186,7 +206,7 @@ def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_
         },
     )
 
-    return avg_loss
+    return avg_loss, avg_iou
 
 
 def main():
@@ -221,8 +241,8 @@ def main():
     
     train_pairs = [p for p in train_pairs if has_eval_mask(p)]
     # temporarily trying to overfit
-    train_pairs = train_pairs[:64]
-    val_pairs = train_pairs[:64]
+    # train_pairs = train_pairs[:64]
+    # val_pairs = train_pairs[:64]
 
     train_dataset = CustomDataset(
         train_pairs,
@@ -294,7 +314,7 @@ def main():
 
     train_loss_history = []
     val_loss_history = []
-    best_val_loss = float("inf")
+    best_val_iou = -1.0
     best_save_path = output_dir / "unet_best_model.pth"
     final_save_path = output_dir / "unet_final_model.pth"
 
@@ -306,32 +326,34 @@ def main():
         maybe_log(wandb_run, {"Train/Epoch_Loss": train_loss, "epoch": epoch + 1})
 
         if len(val_dataloader) > 0:
-            val_loss = evaluate(val_dataloader, model, criterion, device, split_name="Validation", wandb_run=wandb_run)
+            val_loss, val_iou = evaluate(val_dataloader, model, criterion, device, split_name="Validation", wandb_run=wandb_run)
             val_loss_history.append(val_loss)
 
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
+            if val_iou > best_val_iou:
+                best_val_iou = val_iou
                 torch.save(model.state_dict(), best_save_path)
-                print(f"--> Validation loss improved to {best_val_loss:.6f}! Saved best model to {best_save_path}")
+                print(f"--> Validation IoU improved to {best_val_iou:.6f}! Saved best model to {best_save_path}")
         else:
             print("Skipping validation: val_dataloader is empty.")
 
     print("Training Done!\n")
+    torch.save(model.state_dict(), final_save_path)
+    print(f"Final model weights saved to {final_save_path}")
+
     print("-------------------------------\nFinal Evaluation on Test Set:")
     if len(test_dataloader) > 0:
+        if best_save_path.exists():
+            model.load_state_dict(torch.load(best_save_path, map_location=device))
+            print(f"Loaded best validation-IoU model from {best_save_path} for test evaluation.")
         evaluate(test_dataloader, model, criterion, device, split_name="Test", wandb_run=wandb_run)
     else:
         print("Skipping test: test_dataloader is empty.")
-
-    torch.save(model.state_dict(), final_save_path)
-    print(f"Final model weights saved to {final_save_path}")
 
     if wandb_run is not None:
         wandb_run.save(str(final_save_path))
         if best_save_path.exists():
             wandb_run.save(str(best_save_path))
         wandb_run.finish()
-
 
 if __name__ == "__main__":
     main()
