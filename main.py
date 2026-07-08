@@ -292,7 +292,7 @@ def main():
     model = UNet(in_channels=1, num_classes=NUM_CLASSES).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay = args.weight_decay)
     criterion = CombinedLoss(device=device)
-
+    print("running train.py")
     wandb_run = None
     if args.use_wandb:
         import wandb

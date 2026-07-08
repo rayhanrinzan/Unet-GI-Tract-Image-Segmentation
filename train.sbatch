@@ -33,12 +33,12 @@ echo "Dataset path: $GI_TRACT_DATASET_PATH"
 echo "Running on node: $(hostname)"
 echo "Starting at: $(date)"
 
-echo "About to start train.py with W&B..."
+echo "About to start main.py with W&B..."
 echo "WANDB_MODE=${WANDB_MODE:-not set}"
 echo "WANDB_DIR=${WANDB_DIR:-not set}"
 echo "WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-not set}"
 
-$BASE/conda_envs/mri/bin/python -u train.py \
+$BASE/conda_envs/mri/bin/python -u main.py \
 --epochs 5 \
 --batch-size 32 \
 --learning-rate 1e-5 \
