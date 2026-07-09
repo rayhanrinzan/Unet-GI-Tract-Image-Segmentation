@@ -1,3 +1,3 @@
 [submodule "external/segx"]
 	path = external/segx
-	url = git@github.com:imedslab/segx.git
+	url = https://github.com/imedslab/segx.git
