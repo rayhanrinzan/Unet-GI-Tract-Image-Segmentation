@@ -20,6 +20,7 @@ mkdir -p outputs
 mkdir -p $BASE/.cache
 mkdir -p $BASE/wandb
 mkdir -p $BASE/.cache/wandb
+mkdir -p workdir/cache/splits
 
 export HOME=$BASE
 export XDG_CACHE_HOME=$BASE/.cache
@@ -33,19 +34,26 @@ echo "Dataset path: $GI_TRACT_DATASET_PATH"
 echo "Running on node: $(hostname)"
 echo "Starting at: $(date)"
 
-echo "About to start main.py with W&B..."
-echo "WANDB_MODE=${WANDB_MODE:-not set}"
-echo "WANDB_DIR=${WANDB_DIR:-not set}"
-echo "WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-not set}"
+DATASET_ROOT="$GI_TRACT_DATASET_PATH"
+if [ "$(basename "$DATASET_ROOT")" != "dataset" ] && [ -d "$DATASET_ROOT/dataset" ]; then
+  DATASET_ROOT="$DATASET_ROOT/dataset"
+fi
 
-$BASE/conda_envs/mri/bin/python -u main.py \
---epochs 5 \
---batch-size 32 \
---learning-rate 1e-5 \
---num-workers 2 \
---output-dir outputs \
---use-wandb \
---wandb-project "MRI Scans 5" \
---wandb-run-name "unet_slurm_${SLURM_JOB_ID}"
+python scripts/prepare_segx_metadata.py \
+  --dataset-root "$GI_TRACT_DATASET_PATH" \
+  --out-csv metadata/train.csv \
+  --out-mask-dir metadata/masks
+
+uv run --project external/segx segx-build-folds \
+  cfg_path=workdir/config/mri_segx.yaml \
+  root_dir="$DATASET_ROOT" \
+  splits_dir=workdir/cache/splits \
+  seed=42
+
+uv run --project external/segx segx-train \
+  config=workdir/config/mri_segx.yaml \
+  data.datasets.root_dir="$DATASET_ROOT" \
+  train.fold=0 \
+  train.lr=1e-4
 
 echo "Finished at: $(date)"

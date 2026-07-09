@@ -1,136 +1,41 @@
-seed: 42
-debug: false
-device: cuda:0
-job_id: 0
-snapshot_root: workdir/experiments
-experiment_tag: ${model.backbone}_${train.num_epochs}_${train.fold}
-snapshot_dir: ${snapshot_root}/${experiment_tag}_${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}/${job_id}/
-optimizer:
-  cls: torch.optim.Adam
-  params:
-    lr: ${train.lr}
-    weight_decay: ${train.wd}
-    params: ~
-  scheduler:
-    warmup_for: 0
-    warmup_from: ${train.lr}
-    type: milestones
-    gamma: 0.1
-    milestones: ${train.drop_at}
+data:
+  metadata_keys: [ID]
+  groups:
+    - name: gi_organs
+      mode: multiclass
+      classes: [background, large_bowel, small_bowel, stomach]
+  datasets:
+    root_dir: /data/gi_tract
+    train:
+      data_dir: .
+      meta_csv: metadata/train.csv
+
 model:
-  backbone: resnet34
   cls: segx.train.model.segnet.SegModel
   params:
-    arch: unet
-    encoder_name: ${model.backbone}
+    arch: Unet
+    encoder_name: resnet34
     encoder_weights: imagenet
-    in_channels: 3
-    # `classes` is NOT set here: SegmentationEngine.init_model computes it (and
-    # overrides whatever is here) from the total width of data.groups below.
+    in_channels: 1
+
+train:
+  seed: 42
+  fold: 0
+  num_epochs: 10
+  lr: 1e-4
+
 loss:
   cls: segx.train.loss.GroupedLoss
   params:
-    # Shares the same group layout as data.groups, so channel ranges line up.
     groups: ${data.groups}
     group_losses:
-      mask:
+      gi_organs:
         weight: 1.0
         components:
           - cls: segmentation_models_pytorch.losses.DiceLoss
-            weight: 1.0
-            params: {}
-          - cls: segmentation_models_pytorch.losses.SoftCrossEntropyLoss
-            weight: 1.0
+            weight: 0.5
             params:
-              smooth_factor: 0.0
-train:
-  fold: 0
-  ema: false
-  ema_start_after: 1
-  ema_decay: 0.999
-  ema_update_interval: 10
-  engine: segx.train.engine.SegmentationEngine
-  drop_at:
-    - 30
-    - 50
-  save_on:
-    - val_loss
-    - iou
-    - f1
-  num_epochs: 100
-  lr: 0.001
-  bs: 16
-  wd: 0.0001
-data:
-  dataset_cls: segx.train.dataset.SegmentationDataset
-  # A "group" is one named semantic segmentation target: mode is one of
-  # "binary"/"multiclass"/"multilabel", and classes gives its channel count/names.
-  # Groups are laid out as contiguous channel ranges of the model's single output,
-  # in this order. Each group needs a MASK_<name> column in the metadata CSV, and
-  # gets exported as its own PNG (one group, one png) by segx.utils.export.
-  groups:
-    - name: mask
-      mode: multiclass
-      classes:
-        - background
-        - foreground
-  metadata_keys:
-    - ID
-  stratify: ~
-  group_col: ~
-  n_folds: 5
-  num_workers: 8
-  splits_dir: workdir/cache/splits
-  datasets:
-    root_dir: /data/segmentation
-    default:
-      data_dir: images
-      metadata: metadata.csv
-  crop_size: 256
-  augs:
-    train:
-      stream:
-        transforms:
-          - resize:
-              resize_to:
-                - ${data.crop_size}
-                - ${data.crop_size}
-          - flip:
-              p: 0.5
-              axis: 1
-          - rotate:
-              p: 0.5
-              angle_range: 15
-          - noise:
-              p: 0.3
-              gain_range:
-                - 0
-                - 0.1
-    val:
-      stream:
-        transforms:
-          - resize:
-              resize_to:
-                - ${data.crop_size}
-                - ${data.crop_size}
-checkpointer:
-  keep_old: false
-logging:
-  formatters:
-    simple:
-      format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
-  handlers:
-    console:
-      class: logging.StreamHandler
-      formatter: simple
-      stream: ext://sys.stdout
-    file:
-      class: logging.FileHandler
-      filename: ${snapshot_dir}/pipeline.log
-      formatter: simple
-  root:
-    handlers:
-      - console
-      - file
-    level: INFO
-  version: 1
+              mode: multiclass
+          - cls: segmentation_models_pytorch.losses.SoftCrossEntropyLoss
+            weight: 0.5
+            params: {}
