@@ -39,7 +39,7 @@ echo "WANDB_DIR=${WANDB_DIR:-not set}"
 echo "WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-not set}"
 
 $BASE/conda_envs/mri/bin/python -u main.py \
---epochs 5 \
+--epochs 15 \
 --batch-size 32 \
 --learning-rate 1e-5 \
 --num-workers 2 \
