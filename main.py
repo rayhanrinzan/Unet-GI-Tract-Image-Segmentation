@@ -24,13 +24,23 @@ from torch.utils.data import DataLoader
 from dataloader import (
     NUM_CLASSES,
     CustomDataset,
+    PrecomputedMaskDataset,
     build_mask_cache,
+    collect_precomputed_mask_pairs,
     collect_slice_pairs,
     train_transform,
     eval_transform,
+    split_precomputed_pairs_by_scan,
     split_pairs_by_scan,
 )
 from model import UNet
+
+ORGAN_CLASS_NAMES = {
+    1: "large_bowel",
+    2: "small_bowel",
+    3: "stomach",
+}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train U-Net on GI tract MRI segmentation data")
@@ -40,6 +50,12 @@ def parse_args():
         default=os.environ.get("GI_TRACT_DATASET_PATH"),
         help="Path to the dataset root. Can point either to the folder containing 'dataset/' or to 'dataset/' itself. "
              "If omitted, GI_TRACT_DATASET_PATH is used.",
+    )
+    parser.add_argument(
+        "--mask-dataset-root",
+        type=str,
+        default=os.environ.get("UWMGI_MASK_DATASET_PATH"),
+        help="Optional path to awsaf49/uwmgi-mask-dataset. If provided, precomputed .npy masks are used instead of RLE decoding.",
     )
     parser.add_argument("--output-dir", type=str, default="outputs", help="Folder for saved models/logs")
     parser.add_argument("--epochs", type=int, default=10)
@@ -142,21 +158,42 @@ def train_one_epoch(dataloader, model, loss_fn, optimizer, device, wandb_run=Non
             predicted_classes = pred.argmax(1)
             print("pred unique:", torch.unique(predicted_classes, return_counts=True))
             print("true unique:", torch.unique(y, return_counts=True))
-        
-            intersection = ((predicted_classes == y) & (y > 0)).sum().item()
-            union = ((predicted_classes > 0) | (y > 0)).sum().item()
-        
-            batch_iou = intersection / union if union > 0 else 0.0
-        
+
+            per_class_iou = {}
+            for cls in ORGAN_CLASS_NAMES:
+                pred_cls = predicted_classes == cls
+                target_cls = y == cls
+                intersection = (pred_cls & target_cls).sum().item()
+                union = (pred_cls | target_cls).sum().item()
+                if union > 0:
+                    per_class_iou[cls] = intersection / union
+
+            batch_mean_iou = (
+                sum(per_class_iou.values()) / len(per_class_iou)
+                if per_class_iou
+                else 0.0
+            )
+            iou_text = "  ".join(
+                f"{class_name}: {per_class_iou[cls]:.6f}"
+                if cls in per_class_iou
+                else f"{class_name}: n/a"
+                for cls, class_name in ORGAN_CLASS_NAMES.items()
+            )
+
             print(
-                f"loss: {loss_val:>7f}  IoU: {batch_iou:>7f}  [{current:>5d}/{size:>5d}]",
+                f"loss: {loss_val:>7f}  Mean IoU: {batch_mean_iou:>7f}  "
+                f"{iou_text}  [{current:>5d}/{size:>5d}]",
                 flush=True,
             )
-        
-            maybe_log(wandb_run, {
+
+            metrics = {
                 "Train/Step_Loss": loss_val,
-                "Train/Step_IoU": batch_iou,
-            })
+                "Train/Step_Mean_IoU": batch_mean_iou,
+                "Train/Step_IoU": batch_mean_iou,
+            }
+            for cls, class_iou in per_class_iou.items():
+                metrics[f"Train/Step_IoU_{ORGAN_CLASS_NAMES[cls]}"] = class_iou
+            maybe_log(wandb_run, metrics)
             
     return train_loss / max(num_batches, 1)
 
@@ -167,8 +204,8 @@ def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_
     total_loss = 0.0
     total_correct_pixels = 0
     total_pixels = 0
-    iou_sum = 0.0
-    iou_count = 0
+    iou_intersections = torch.zeros(NUM_CLASSES, device=device)
+    iou_unions = torch.zeros(NUM_CLASSES, device=device)
 
     with torch.no_grad():
         for x, y in dataloader:
@@ -180,30 +217,42 @@ def evaluate(dataloader, model, loss_fn, device, split_name="Validation", wandb_
             total_correct_pixels += (predicted_classes == y).sum().item()
             total_pixels += y.numel()
 
-            EVAL_CLASSES = [1, 2, 3]
-            for cls in EVAL_CLASSES:    
-                inter = ((predicted_classes == cls) & (y == cls)).sum().item()
-                union = ((predicted_classes == cls) | (y == cls)).sum().item()
-                if union > 0:
-                    iou_sum += inter / union
-                    iou_count += 1
+            for cls in ORGAN_CLASS_NAMES:
+                pred_cls = predicted_classes == cls
+                target_cls = y == cls
+                iou_intersections[cls] += (pred_cls & target_cls).sum()
+                iou_unions[cls] += (pred_cls | target_cls).sum()
 
     avg_loss = total_loss / max(num_batches, 1)
     pixel_acc = total_correct_pixels / max(total_pixels, 1)
-    avg_iou = iou_sum / max(iou_count, 1)
+    per_class_iou = {}
+    for cls in ORGAN_CLASS_NAMES:
+        if iou_unions[cls] > 0:
+            per_class_iou[cls] = (iou_intersections[cls] / iou_unions[cls]).item()
+
+    if per_class_iou:
+        avg_iou = sum(per_class_iou.values()) / len(per_class_iou)
+    else:
+        avg_iou = 0.0
 
     print(f"{split_name} results:")
     print(f"  Avg loss: {avg_loss:>8f}")
     print(f"  Pixel Accuracy: {(100 * pixel_acc):>0.2f}%")
+    for cls, class_iou in per_class_iou.items():
+        print(f"  IoU ({ORGAN_CLASS_NAMES[cls]}): {class_iou:>8f}")
     print(f"  Mean IoU (Organs): {avg_iou:>8f}\n", flush=True)
+
+    metrics = {
+        f"{split_name}/Epoch_Loss": avg_loss,
+        f"{split_name}/Pixel_Accuracy": pixel_acc,
+        f"{split_name}/Mean_IoU": avg_iou,
+    }
+    for cls, class_iou in per_class_iou.items():
+        metrics[f"{split_name}/IoU_{ORGAN_CLASS_NAMES[cls]}"] = class_iou
 
     maybe_log(
         wandb_run,
-        {
-            f"{split_name}/Epoch_Loss": avg_loss,
-            f"{split_name}/Pixel_Accuracy": pixel_acc,
-            f"{split_name}/Mean_IoU": avg_iou,
-        },
+        metrics,
     )
 
     return avg_loss, avg_iou
@@ -225,33 +274,58 @@ def main():
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-    slice_contour_pairs = collect_slice_pairs(dataset_path)
-    mask_dfs_cache = build_mask_cache(slice_contour_pairs)
-    train_pairs, val_pairs, test_pairs = split_pairs_by_scan(slice_contour_pairs, args.seed)
-   
-    def has_eval_mask(pair):
-        slice_id, _, contour_csv_path = pair
-        df = mask_dfs_cache[contour_csv_path]
-        rows = df[df["SliceID"] == slice_id]
-    
-        # MaskTypeID: 1 large_bowel, 3 small_bowel, 4 stomach
-        rows = rows[rows["MaskTypeID"].isin([1, 3, 4])]
-    
-        return (rows["EncodedPixels"].astype(str) != "-1").any()
-    
-    train_pairs = [p for p in train_pairs if has_eval_mask(p)]
-    # temporarily trying to overfit
-    # train_pairs = train_pairs[:64]
-    # val_pairs = train_pairs[:64]
+    if args.mask_dataset_root:
+        print(f"Using precomputed mask dataset: {Path(args.mask_dataset_root).expanduser().resolve()}")
+        image_mask_pairs = collect_precomputed_mask_pairs(dataset_path, args.mask_dataset_root)
+        train_pairs, val_pairs, test_pairs = split_precomputed_pairs_by_scan(image_mask_pairs, args.seed)
 
-    train_dataset = CustomDataset(
-        train_pairs,
-        eval_transform if args.no_augment else train_transform,
-        mask_data_cache=mask_dfs_cache,
-    )
-    
-    val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
-    test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+        def has_eval_mask(pair):
+            _, mask_path = pair
+            mask = np.load(mask_path)
+            return (mask > 0).any()
+
+        train_pairs = [p for p in train_pairs if has_eval_mask(p)]
+        val_pairs = [p for p in val_pairs if has_eval_mask(p)]
+        test_pairs = [p for p in test_pairs if has_eval_mask(p)]
+
+        train_dataset = PrecomputedMaskDataset(
+            train_pairs,
+            eval_transform if args.no_augment else train_transform,
+        )
+
+        val_dataset = PrecomputedMaskDataset(val_pairs, eval_transform)
+        test_dataset = PrecomputedMaskDataset(test_pairs, eval_transform)
+    else:
+        slice_contour_pairs = collect_slice_pairs(dataset_path)
+        mask_dfs_cache = build_mask_cache(slice_contour_pairs)
+        train_pairs, val_pairs, test_pairs = split_pairs_by_scan(slice_contour_pairs, args.seed)
+
+        def has_eval_mask(pair):
+            slice_id, _, contour_csv_path = pair
+            df = mask_dfs_cache[contour_csv_path]
+            rows = df[df["SliceID"] == slice_id]
+
+            # MaskTypeID: 1 large_bowel, 3 small_bowel, 4 stomach
+            rows = rows[rows["MaskTypeID"].isin([1, 3, 4])]
+
+            encoded_pixels = rows["EncodedPixels"]
+            return (encoded_pixels.notna() & (encoded_pixels.astype(str) != "-1")).any()
+
+        train_pairs = [p for p in train_pairs if has_eval_mask(p)]
+        val_pairs = [p for p in val_pairs if has_eval_mask(p)]
+        test_pairs = [p for p in test_pairs if has_eval_mask(p)]
+        # temporarily trying to overfit
+        # train_pairs = train_pairs[:64]
+        # val_pairs = train_pairs[:64]
+
+        train_dataset = CustomDataset(
+            train_pairs,
+            eval_transform if args.no_augment else train_transform,
+            mask_data_cache=mask_dfs_cache,
+        )
+
+        val_dataset = CustomDataset(val_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
+        test_dataset = CustomDataset(test_pairs, eval_transform, mask_data_cache=mask_dfs_cache)
 
     for i in range(10):
         img, target = train_dataset[i]

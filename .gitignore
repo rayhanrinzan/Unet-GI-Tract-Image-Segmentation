@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+
+# Training outputs and experiment tracking
+outputs/
+checkpoints/
+logs/
+wandb/
+*.pth
+
+# Slurm job logs
+slurm-*.out
+slurm-*.err
+
+# Machine-specific dataset locations
+dataset_path.txt
+mask_dataset_path.txt
