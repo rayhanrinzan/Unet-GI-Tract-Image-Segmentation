@@ -24,12 +24,14 @@ mkdir -p $BASE/.cache/wandb
 export HOME=$BASE
 export XDG_CACHE_HOME=$BASE/.cache
 export GI_TRACT_DATASET_PATH="$(cat dataset_path.txt)"
+unset UWMGI_MASK_DATASET_PATH
 
 export WANDB_DIR=$BASE/wandb
 export WANDB_CACHE_DIR=$BASE/.cache/wandb
 export WANDB_MODE=online
 
 echo "Dataset path: $GI_TRACT_DATASET_PATH"
+echo "Precomputed mask dataset: disabled (using contour RLE masks)"
 echo "Running on node: $(hostname)"
 echo "Starting at: $(date)"
 
@@ -41,10 +43,11 @@ echo "WANDB_CACHE_DIR=${WANDB_CACHE_DIR:-not set}"
 $BASE/conda_envs/mri/bin/python -u main.py \
 --epochs 15 \
 --batch-size 32 \
---learning-rate 1e-5 \
+--learning-rate 1e-4 \
 --num-workers 2 \
 --output-dir outputs \
 --use-wandb \
+--no-augment \
 --wandb-project "MRI Scans 5" \
 --wandb-run-name "unet_slurm_${SLURM_JOB_ID}"
 
