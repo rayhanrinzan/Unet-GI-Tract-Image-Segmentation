@@ -47,7 +47,6 @@ $BASE/conda_envs/mri/bin/python -u main.py \
 --num-workers 2 \
 --output-dir outputs \
 --use-wandb \
---no-augment \
 --wandb-project "MRI Scans 5" \
 --wandb-run-name "unet_slurm_${SLURM_JOB_ID}"
 
